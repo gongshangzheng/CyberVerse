@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -93,20 +94,19 @@ func newAvatarModelTestRouter(t *testing.T, activeModel string) (*Router, *chara
 inference:
   avatar:
     default: "flash_head"
+    runtime:
+      cuda_visible_devices: "0,1"
+      world_size: 2
     flash_head:
       plugin_class: "inference.plugins.avatar.flash_head_plugin.FlashHeadAvatarPlugin"
       checkpoint_dir: "/tmp/flash"
       wav2vec_dir: "/tmp/wav2vec"
       model_type: "pro"
-      cuda_visible_devices: "0,1"
-      world_size: 2
     live_act:
       plugin_class: "inference.plugins.avatar.live_act_plugin.LiveActAvatarPlugin"
       ckpt_dir: "/tmp/live_act"
       wav2vec_dir: "/tmp/live_wav2vec"
       fps: 24
-      cuda_visible_devices: "0,1"
-      world_size: 2
 `
 	if err := os.WriteFile(configPath, []byte(configYAML), 0644); err != nil {
 		t.Fatal(err)
@@ -161,12 +161,17 @@ func TestGetAvatarModelInfoUsesRuntimeModel(t *testing.T) {
 	if resp.ConfiguredDefaultModel != "flash_head" {
 		t.Fatalf("expected configured_default_model flash_head, got %q", resp.ConfiguredDefaultModel)
 	}
+	for _, model := range resp.Models {
+		if model.Name == "runtime" {
+			t.Fatalf("did not expect runtime helper node to appear as an avatar model")
+		}
+	}
 	if resp.ConfigStatus.HasInferParams {
 		t.Fatalf("expected live_act infer params to be absent")
 	}
 }
 
-func TestGetLaunchConfigUsesActiveModelAndSkipsMissingInferParams(t *testing.T) {
+func TestGetLaunchConfigUsesSharedAvatarRuntimeGPUSettingsAndSkipsMissingInferParams(t *testing.T) {
 	r, _ := newAvatarModelTestRouter(t, "live_act")
 
 	req := httptest.NewRequest("GET", "/api/v1/config/launch?model=flash_head", nil)
@@ -188,6 +193,22 @@ func TestGetLaunchConfigUsesActiveModelAndSkipsMissingInferParams(t *testing.T) 
 		if section.Title == "视频输出" {
 			t.Fatalf("did not expect 视频输出 section when infer_params.yaml is missing")
 		}
+		if section.Title != "GPU 配置" {
+			continue
+		}
+		paths := map[string]bool{}
+		for _, param := range section.Params {
+			paths[param.Path] = true
+		}
+		if !paths["inference.avatar.runtime.cuda_visible_devices"] {
+			t.Fatalf("expected shared avatar runtime cuda_visible_devices in GPU section")
+		}
+		if !paths["inference.avatar.runtime.world_size"] {
+			t.Fatalf("expected shared avatar runtime world_size in GPU section")
+		}
+		if paths["inference.avatar.live_act.world_size"] {
+			t.Fatalf("did not expect live_act-specific world_size once shared runtime is present")
+		}
 	}
 }
 
@@ -202,6 +223,32 @@ func TestUpdateLaunchConfigRejectsNonActiveModel(t *testing.T) {
 
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d", w.Code)
+	}
+}
+
+func TestUpdateLaunchConfigAllowsSharedAvatarRuntimeUpdates(t *testing.T) {
+	r, _ := newAvatarModelTestRouter(t, "live_act")
+
+	body := `{"model":"live_act","params":[{"path":"inference.avatar.runtime.world_size","value":1}]}`
+	req := httptest.NewRequest("PUT", "/api/v1/config/launch", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	doc, err := config.ReadYAMLNode(r.configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, err := config.GetNodeAtPath(doc, "inference.avatar.runtime.world_size")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fmt.Sprint(config.NodeValue(node, true)); got != "1" {
+		t.Fatalf("expected shared world_size to be updated to 1, got %#v", got)
 	}
 }
 

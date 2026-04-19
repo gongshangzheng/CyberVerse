@@ -46,12 +46,17 @@ func (r *Router) handleHealth(w http.ResponseWriter, req *http.Request) {
 		errorMessage = inferenceErr.Error()
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
+	payload := map[string]any{
 		"status":              status,
 		"sessions":            r.sessionMgr.Count(),
 		"inference_connected": connected,
 		"error":               errorMessage,
-	})
+	}
+	if body, err := json.Marshal(payload); err == nil {
+		log.Printf("[health] GET /api/v1/health response: %s", body)
+	}
+
+	writeJSON(w, http.StatusOK, payload)
 }
 
 func (r *Router) handleCreateSession(w http.ResponseWriter, req *http.Request) {

@@ -72,6 +72,10 @@ class InferenceServer:
         params = {k: v for k, v in conf.items() if k != "plugin_class"}
         shared: dict[str, object] = {}
         if category == "avatar":
+            avatar = self.config.get("inference", {}).get("avatar", {})
+            runtime = avatar.get("runtime")
+            if isinstance(runtime, dict):
+                params = {**runtime, **params}
             warmup = self.config.get("warmup")
             if isinstance(warmup, dict):
                 shared["warmup"] = warmup

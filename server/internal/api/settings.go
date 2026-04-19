@@ -242,6 +242,12 @@ var gpuKeys = map[string]bool{
 	"world_size":           true,
 }
 
+var gpuKeyOrder = []string{
+	"cuda_visible_devices",
+	"world_size",
+	"device",
+}
+
 // Readonly keys in infer_params.yaml.
 var inferParamsReadonly = map[string]bool{}
 
@@ -303,7 +309,7 @@ func (r *Router) configuredAvatarModels() []string {
 	}
 	models := make([]string, 0, len(keys))
 	for _, key := range keys {
-		if key == "default" {
+		if key == "default" || key == "runtime" {
 			continue
 		}
 		models = append(models, key)
@@ -394,6 +400,7 @@ func (r *Router) buildLaunchSections(modelName string) []launchConfigSectionJSON
 		doc, err := config.ReadYAMLNode(r.configPath)
 		if err == nil {
 			modelPath := "inference.avatar." + modelName
+			modelGPUParams := map[string]launchConfigParamJSON{}
 			keys, err := config.GetMappingKeys(doc, modelPath)
 			if err == nil {
 				for _, key := range keys {
@@ -416,10 +423,41 @@ func (r *Router) buildLaunchSections(modelName string) []launchConfigSectionJSON
 						p.Options = meta.Options
 					}
 					if gpuKeys[key] {
-						gpuSection.Params = append(gpuSection.Params, p)
+						modelGPUParams[key] = p
 					} else {
 						avatarSection.Params = append(avatarSection.Params, p)
 					}
+				}
+			}
+
+			runtimeGPUParams := map[string]launchConfigParamJSON{}
+			runtimePath := "inference.avatar.runtime"
+			runtimeKeys, err := config.GetMappingKeys(doc, runtimePath)
+			if err == nil {
+				for _, key := range runtimeKeys {
+					if !gpuKeys[key] {
+						continue
+					}
+					node, err := config.GetNodeAtPath(doc, runtimePath+"."+key)
+					if err != nil {
+						continue
+					}
+					runtimeGPUParams[key] = launchConfigParamJSON{
+						Name:            key,
+						Path:            runtimePath + "." + key,
+						Value:           config.NodeValue(node, true),
+						RequiresRestart: true,
+					}
+				}
+			}
+
+			for _, key := range gpuKeyOrder {
+				if p, ok := modelGPUParams[key]; ok {
+					gpuSection.Params = append(gpuSection.Params, p)
+					continue
+				}
+				if p, ok := runtimeGPUParams[key]; ok {
+					gpuSection.Params = append(gpuSection.Params, p)
 				}
 			}
 		}
@@ -516,6 +554,7 @@ func (r *Router) handleUpdateLaunchConfig(w http.ResponseWriter, req *http.Reque
 	inferUpdates := map[string]string{} // key -> value
 
 	modelPrefix := "inference.avatar." + body.Model + "."
+	runtimePrefix := "inference.avatar.runtime."
 
 	for _, p := range body.Params {
 		// Determine source and validate.
@@ -528,6 +567,15 @@ func (r *Router) handleUpdateLaunchConfig(w http.ResponseWriter, req *http.Reque
 				return
 			}
 			inferUpdates[key] = fmt.Sprintf("%v", p.Value)
+		} else if strings.HasPrefix(p.Path, runtimePrefix) {
+			key := strings.TrimPrefix(p.Path, runtimePrefix)
+			if !gpuKeys[key] {
+				writeJSON(w, http.StatusBadRequest, ErrorResponse{
+					Error: fmt.Sprintf("parameter %q is not a shared runtime parameter", p.Path),
+				})
+				return
+			}
+			mainUpdates[p.Path] = fmt.Sprintf("%v", p.Value)
 		} else if strings.HasPrefix(p.Path, modelPrefix) {
 			key := strings.TrimPrefix(p.Path, modelPrefix)
 			meta, hasMeta := paramMeta[key]

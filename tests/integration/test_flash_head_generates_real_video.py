@@ -344,8 +344,10 @@ async def test_flash_head_generates_mp4_file():
     os.chdir(REPO_ROOT)
 
     raw = load_config(str(REPO_ROOT / "cyberverse_config.yaml"))
-    section = raw["inference"]["avatar"]["flash_head"]
-    params = {k: v for k, v in section.items() if k != "plugin_class"}
+    avatar_cfg = raw["inference"]["avatar"]
+    section = avatar_cfg["flash_head"]
+    runtime = avatar_cfg.get("runtime", {})
+    params = {k: v for k, v in {**runtime, **section}.items() if k != "plugin_class"}
     for key in ("checkpoint_dir", "wav2vec_dir", "models_dir"):
         if key in params and params[key]:
             p = Path(params[key])

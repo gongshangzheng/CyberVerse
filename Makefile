@@ -24,7 +24,7 @@ test-integration:
 	python -m pytest tests/integration/ -m integration -v -s
 
 # Development servers
-#   Reads world_size from cyberverse_config.yaml; auto-selects python vs torchrun.
+#   Reads avatar runtime GPU settings from cyberverse_config.yaml; auto-selects python vs torchrun.
 #   Override with env vars for ad-hoc testing:
 #     WORLD_SIZE=2 CUDA_VISIBLE_DEVICES=0,1 make inference
 inference:

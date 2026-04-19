@@ -144,11 +144,12 @@ Edit `cyberverse_config.yaml`, update the model paths to match your local checkp
 ```yaml
 inference:
   avatar:
+    runtime:
+      cuda_visible_devices: 0      # shared GPU ID(s), e.g. 0,1 for multi-GPU
+      world_size: 1                # shared GPU count, set to 2 for dual-GPU
     flash_head:
       checkpoint_dir: "./checkpoints/SoulX-FlashHead-1_3B"  # ← your path
       wav2vec_dir: "./checkpoints/wav2vec2-base-960h"        # ← your path
-      cuda_visible_devices: 0      # your GPU ID(s), e.g. 0,1 for multi-GPU
-      world_size: 1                # GPU count, set to 2 for dual-GPU
       model_type: "lite"           # "pro" for higher quality (needs more GPU)
 ```
 

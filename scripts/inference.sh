@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Unified inference launcher.
-# Reads world_size / cuda_visible_devices from cyberverse_config.yaml,
+# Reads shared avatar runtime GPU settings from cyberverse_config.yaml,
 # then auto-selects plain python (single GPU) or torchrun (multi GPU).
 # Environment variables still override config values for ad-hoc debugging.
 set -euo pipefail
@@ -18,28 +18,57 @@ if [[ -f ./.env ]]; then
   set +a
 fi
 
-# ── Read GPU config from YAML (fallback if env not set) ─────────────────────
-_yaml_val() {
-  # Try PyYAML first (always available on inference server); fall back to grep.
-  python3 -c "
+# ── Read YAML values (env still wins when set) ──────────────────────────────
+_yaml_first_val() {
+  python3 - "$CONFIG" "$@" <<'PY'
+import sys
 import yaml
-cfg = yaml.safe_load(open('${CONFIG}'))
-val = cfg
-for k in '$1'.split('.'):
-    val = val[k]
-print(val)
-" 2>/dev/null || grep -E "^\s+${1##*.}:" "${CONFIG}" | head -1 | sed 's/.*: *//' | tr -d '"'"'" || echo "$2"
+
+config_path = sys.argv[1]
+paths = sys.argv[2:-1]
+default = sys.argv[-1]
+
+with open(config_path, "r", encoding="utf-8") as f:
+    cfg = yaml.safe_load(f) or {}
+
+
+def lookup(root, dotted):
+    value = root
+    for key in dotted.split("."):
+        if not isinstance(value, dict) or key not in value:
+            return None
+        value = value[key]
+    return value
+
+
+for path in paths:
+    value = lookup(cfg, path)
+    if value is None:
+        continue
+    if isinstance(value, str) and value.strip() == "":
+        continue
+    print(value)
+    break
+else:
+    print(default)
+PY
 }
 
 # Detect active avatar model from config
-AVATAR_MODEL="$(_yaml_val 'inference.avatar.default' 'flash_head')"
+AVATAR_MODEL="$(_yaml_first_val 'inference.avatar.default' 'flash_head')"
 echo "[inference] Active avatar model: ${AVATAR_MODEL}"
 
 if [[ -z "${WORLD_SIZE:-}" ]]; then
-  WORLD_SIZE="$(_yaml_val "inference.avatar.${AVATAR_MODEL}.world_size" '1')"
+  WORLD_SIZE="$(_yaml_first_val \
+    "inference.avatar.${AVATAR_MODEL}.world_size" \
+    "inference.avatar.runtime.world_size" \
+    '1')"
 fi
 if [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
-  CUDA_VISIBLE_DEVICES="$(_yaml_val "inference.avatar.${AVATAR_MODEL}.cuda_visible_devices" '')"
+  CUDA_VISIBLE_DEVICES="$(_yaml_first_val \
+    "inference.avatar.${AVATAR_MODEL}.cuda_visible_devices" \
+    "inference.avatar.runtime.cuda_visible_devices" \
+    '')"
 fi
 
 MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"

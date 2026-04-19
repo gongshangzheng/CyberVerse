@@ -143,11 +143,12 @@ huggingface-cli download TencentGameMate/chinese-wav2vec2-base \
 ```yaml
 inference:
   avatar:
+    runtime:
+      cuda_visible_devices: 0      # 共享 GPU ID，例如多卡可写 0,1
+      world_size: 1                # 共享 GPU 数量，双卡时设为 2
     flash_head:
       checkpoint_dir: "./checkpoints/SoulX-FlashHead-1_3B"  # ← 你的路径
       wav2vec_dir: "./checkpoints/wav2vec2-base-960h"        # ← 你的路径
-      cuda_visible_devices: 0      # 你的 GPU ID，例如多卡可写 0,1
-      world_size: 1                # GPU 数量，双卡时设为 2
       model_type: "lite"           # 如需更高画质可设为 "pro"（需要更多 GPU）
 ```
 

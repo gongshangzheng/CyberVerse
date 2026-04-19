@@ -4,7 +4,7 @@ import { useRouter, useRoute } from 'vue-router'
 import { useCharacterStore } from '../stores/characters'
 import { createSession, getAvatarModelInfo, getHealth, getLaunchConfig, updateLaunchConfig } from '../services/api'
 import CvSelect from '../components/CvSelect.vue'
-import type { AvatarModelInfo, ConfigSection } from '../types'
+import type { AvatarModelInfo, ConfigSection, ConfigParam } from '../types'
 
 const router = useRouter()
 const route = useRoute()
@@ -51,6 +51,20 @@ const hasChanges = computed(() => {
   return JSON.stringify(configSections.value) !== JSON.stringify(originalSections.value)
 })
 
+function sectionHasRestartPending(section: ConfigSection): boolean {
+  const orig = originalSections.value.find(s => s.title === section.title)
+  if (!orig) return false
+  for (const param of section.params) {
+    if (!param.requires_restart) continue
+    const origParam = orig.params.find((p: ConfigParam) => p.path === param.path)
+    if (origParam && origParam.value !== param.value) return true
+  }
+  return false
+}
+
+const restartBadgeHint =
+  '当前修改尚未写入配置文件。「需重启」仅表示生效方式；若未先保存，单独重启推理服务不会应用这些数值。'
+
 onMounted(async () => {
   await store.fetchOne(characterId.value).catch(() => {})
   try {
@@ -93,7 +107,10 @@ async function saveConfig() {
     }
   }
 
-  if (changedParams.length === 0) return
+  if (changedParams.length === 0) {
+    saving.value = false
+    return
+  }
 
   try {
     const resp = await updateLaunchConfig({
@@ -215,7 +232,7 @@ async function launch() {
         <div>
           <h1 class="text-[28px] font-extrabold text-[#fbf6ef]">部署配置</h1>
           <p class="text-sm text-[#6e7682] mt-2">
-            根据您的硬件环境调整推理参数。当前运行模型：{{ activeAvatarModel || '未连接' }}。标记锁定图标的配置需要重启推理服务
+            根据您的硬件环境调整推理参数。当前运行模型：{{ activeAvatarModel || '未连接' }}
           </p>
         </div>
 
@@ -247,9 +264,28 @@ async function launch() {
               </span>
               <span class="text-sm font-bold text-[#c8d0dc]">{{ section.title }}</span>
             </div>
-            <span class="px-2 py-0.5 text-[11px] bg-[rgba(255,147,70,0.12)] border border-[rgba(255,147,70,0.4)] text-[#ff9346]">
-              需重启
-            </span>
+            <div
+              v-if="sectionHasRestartPending(section)"
+              class="group relative flex items-center gap-1"
+            >
+              <span class="px-2 py-0.5 text-[11px] bg-[rgba(255,147,70,0.12)] border border-[rgba(255,147,70,0.4)] text-[#ff9346]">
+                需重启
+              </span>
+              <button
+                type="button"
+                class="inline-flex h-[18px] min-w-[18px] shrink-0 cursor-help items-center justify-center rounded-full border border-[rgba(255,147,70,0.45)] bg-[rgba(255,147,70,0.06)] px-1 text-[11px] font-semibold leading-none text-[#ff9346] outline-none hover:bg-[rgba(255,147,70,0.12)] focus-visible:ring-2 focus-visible:ring-[rgba(255,147,70,0.45)]"
+                tabindex="0"
+                :aria-label="restartBadgeHint"
+              >
+                ?
+              </button>
+              <div
+                role="tooltip"
+                class="pointer-events-none invisible absolute right-0 top-[calc(100%+6px)] z-30 w-[min(288px,calc(100vw-3rem))] rounded-md border border-white/10 bg-[#12161c] px-3 py-2 text-left text-[11px] leading-relaxed text-[#b8c0cc] shadow-xl opacity-0 transition-opacity duration-150 group-hover:visible group-hover:opacity-100 group-focus-within:visible group-focus-within:opacity-100"
+              >
+                {{ restartBadgeHint }}
+              </div>
+            </div>
           </div>
 
           <!-- Params -->

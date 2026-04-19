@@ -18,16 +18,15 @@ warmup:
 inference:
     avatar:
         default: "live_act"
+        runtime:
+            cuda_visible_devices: 0,1
+            world_size: 2
         flash_head:
             plugin_class: "inference.plugins.avatar.flash_head_plugin.FlashHeadAvatarPlugin"
             models_dir: "models"
             checkpoint_dir: "/root/autodl-tmp/models/SoulX-FlashHead-1_3B"
             wav2vec_dir: "/root/autodl-tmp/models/wav2vec2-base-960h"
             model_type: "pro"
-            # 指定可见GPU卡号，等价于导出 CUDA_VISIBLE_DEVICES=0,1
-            cuda_visible_devices: 0,1
-            # 单机单任务多卡：设置为2/4等；需使用torchrun启动并保证WORLD_SIZE一致
-            world_size: 2
             device: "cuda:0"
             seed: 9999
         live_act:
@@ -44,8 +43,6 @@ inference:
             offload_cache: false
             block_offload: false
             mean_memory: false
-            cuda_visible_devices: 0,1
-            world_size: 2
             compile_wan_model: false
             compile_vae_decode: false
             default_prompt: "一个人在说话"
