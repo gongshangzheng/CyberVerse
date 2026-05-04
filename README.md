@@ -65,6 +65,7 @@ Real-time video conversation requires GPU acceleration. Below are benchmarks for
 | Model | Quality | GPU | Count | Resolution | FPS | Real-time? |
 |-------|---------|-----|-------|------------|-----|------------|
 | FlashHead 1.3B | Pro | RTX 5090 | 2 | 512×512 | 25+ | ✅ Yes |
+| FlashHead 1.3B | Pro | RTX 5090 | 1 | 464x464 | 20 | ✅ Yes |
 | FlashHead 1.3B | Pro | RTX PRO 6000 | 1 | 512×512 | 20 | ✅ Yes |
 | FlashHead 1.3B | Pro | RTX 4090 | 1 | 512×512 | ~10.8 | ❌ No |
 | FlashHead 1.3B | Lite | RTX 4090 | 1 | 512×512 | 25+ | ✅ Yes |
@@ -310,12 +311,6 @@ If you want the browser to connect to the remote server directly instead of thro
 
 Open http://localhost:5173 in your browser — you're ready to go.
 
-### User-Side Visual Input
-
-`standard` sessions support user camera input and screen sharing. After the user explicitly enables a source, the frontend samples low-rate JPEG frames and attaches the latest frames to the next text turn's multimodal LLM request. `voice_llm` sessions do not consume visual input and do not auto-switch to the standard pipeline.
-
-Camera and screen capture require HTTPS or localhost in the browser. Sampling interval, frame size, and payload limits are configured under `pipeline.visual_input`.
-
 ## Roadmap
 
 ### 1. **Digital Human Creation Platform**  
@@ -330,8 +325,8 @@ Configure characters, inference, and launch real-time digital-human sessions.
 - [x] Hybrid input: supports both voice and text in the same conversation
 - [x] Voice interruption while the model is speaking, plus session pause and resume
 - [x] User camera input and screen-sharing visual frames in standard mode
+- [x] Face-to-face: user-side camera/screen input
 - [ ] Import knowledge, documents, and biographical material for character-grounded RAG Q&A
-- [ ] Face-to-face: user-side camera/video input with understanding of motion, gestures, and other visual cues
 - [ ] Embeddable for developers (Web component or SDK) to integrate self-hosted instances into their own sites
 - [ ] Live streaming: audio/video output for broadcast-style use cases
 
