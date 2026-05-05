@@ -45,6 +45,15 @@
 頭脳、顔、声、耳。そのすべてのコンポーネントを差し替え可能なプラグインとして扱えます。YAML 設定で LLM、TTS エンジン、ASR モデル、アバターバックエンドを自由に組み合わせられます。GPT-4o、Doubao、OpenAI TTS、Whisper、FlashHead を標準でサポートしています。
 
 ## デモ
+<p align="center"><em>ここに表示しているキャラクターはデモ例です。CyberVerse に同梱されておらず、商用利用向けには提供されません。</em></p>
+
+<p align="center">
+  <a href="docs/assets/character1.png"><img src="docs/assets/character1.png" alt="CyberVerse キャラクター選択ギャラリー" width="100%"/></a>
+</p>
+
+<p align="center">
+  <a href="docs/assets/character2.png"><img src="docs/assets/character2.png" alt="CyberVerse キャラクター例ギャラリー" width="100%"/></a>
+</p>
 
 <div align="center">
 

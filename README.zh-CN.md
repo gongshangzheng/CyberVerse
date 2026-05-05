@@ -45,6 +45,17 @@
 大脑、面孔、声音、听觉——各模块可插拔。通过 YAML 即可组合 LLM、TTS、ASR 与 Avatar 后端。
 
 ## 演示
+<p align="center"><em>所有角色仅用于 Demo 演示，不会随 CyberVerse 内置提供，也不用于商业用途。</em></p>
+<p align="center">
+  <a href="docs/assets/character1.png"><img src="docs/assets/character1.png" alt="CyberVerse 角色选择界面" width="100%"/></a>
+</p>
+
+<p align="center">
+  <a href="docs/assets/character2.png"><img src="docs/assets/character2.png" alt="CyberVerse 角色示例界面" width="100%"/></a>
+</p>
+
+
+
 
 <div align="center">
 

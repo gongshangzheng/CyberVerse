@@ -45,6 +45,15 @@
 두뇌, 얼굴, 목소리, 귀까지 모든 구성 요소를 교체 가능한 플러그인으로 다룰 수 있습니다. YAML 설정을 통해 LLM, TTS 엔진, ASR 모델, 아바타 백엔드를 자유롭게 조합할 수 있습니다. 기본으로 GPT-4o, Doubao, OpenAI TTS, Whisper, FlashHead를 지원합니다.
 
 ## 데모
+<p align="center"><em>여기에 표시된 캐릭터는 데모 예시일 뿐입니다. CyberVerse에 내장되어 제공되지 않으며, 상업적 용도로 제공되지 않습니다.</em></p>
+
+<p align="center">
+  <a href="docs/assets/character1.png"><img src="docs/assets/character1.png" alt="CyberVerse 캐릭터 선택 갤러리" width="100%"/></a>
+</p>
+
+<p align="center">
+  <a href="docs/assets/character2.png"><img src="docs/assets/character2.png" alt="CyberVerse 캐릭터 예시 갤러리" width="100%"/></a>
+</p>
 
 <div align="center">
 

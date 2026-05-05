@@ -45,6 +45,15 @@ Upload a single photo to create your digital human. State-of-the-art avatar mode
 Brain, face, voice, ears — every component is a swappable plugin. Mix and match LLMs, TTS engines, ASR models, and avatar backends via YAML config.
 
 ## Demo
+<p align="center"><em>Characters shown here are demo examples only. They are not bundled with CyberVerse and are not provided for commercial use.</em></p>
+
+<p align="center">
+  <a href="docs/assets/character1.png"><img src="docs/assets/character1.png" alt="CyberVerse character selection gallery" width="100%"/></a>
+</p>
+
+<p align="center">
+  <a href="docs/assets/character2.png"><img src="docs/assets/character2.png" alt="CyberVerse character gallery examples" width="100%"/></a>
+</p>
 
 <div align="center">
 
