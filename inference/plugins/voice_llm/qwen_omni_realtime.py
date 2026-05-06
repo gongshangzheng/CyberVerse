@@ -193,8 +193,8 @@ class QwenOmniRealtimePlugin(VoiceLLMPlugin):
         output_queue: asyncio.Queue[VoiceLLMOutputEvent | Exception | None],
     ) -> None:
         try:
-            sent_audio = False
             pending_image: ImageFrame | None = None
+            has_sent_audio = False
             async for event in input_stream:
                 if event.text:
                     raise RuntimeError(
@@ -203,6 +203,7 @@ class QwenOmniRealtimePlugin(VoiceLLMPlugin):
                         "not exposed."
                     )
                 if event.audio:
+                    has_sent_audio = True
                     await self._send_json(
                         ws,
                         {
@@ -211,18 +212,21 @@ class QwenOmniRealtimePlugin(VoiceLLMPlugin):
                             "audio": base64.b64encode(event.audio).decode("ascii"),
                         },
                     )
-                    if not sent_audio:
-                        sent_audio = True
-                        if pending_image is not None:
-                            await self._send_image(ws, session_id, pending_image)
-                            pending_image = None
+                    # Keep image strictly after an audio append. This avoids provider-side
+                    # ordering violations when a new turn starts and an image arrives first.
+                    if pending_image is not None:
+                        await self._send_image(ws, session_id, pending_image)
+                        pending_image = None
                 if event.image is not None:
                     if not self._valid_image(event.image):
                         continue
-                    if sent_audio:
-                        await self._send_image(ws, session_id, event.image)
-                    else:
-                        pending_image = event.image
+                    # Always buffer the latest valid frame and flush it only after
+                    # the next audio chunk is appended.
+                    pending_image = event.image
+            if pending_image is not None and has_sent_audio:
+                # If stream ends after image input, flush once to avoid dropping
+                # the latest frame while still guaranteeing audio-first ordering.
+                await self._send_image(ws, session_id, pending_image)
         except Exception as exc:
             await output_queue.put(exc)
         finally:
