@@ -160,10 +160,10 @@ pip install "huggingface_hub[cli]"
 # 중국 본토에서는 먼저 미러를 사용할 수 있습니다:
 # export HF_ENDPOINT=https://hf-mirror.com
 
-huggingface-cli download Soul-AILab/SoulX-FlashHead-1_3B \
+hf download Soul-AILab/SoulX-FlashHead-1_3B \
   --local-dir ./checkpoints/SoulX-FlashHead-1_3B
 
-huggingface-cli download facebook/wav2vec2-base-960h \
+hf download facebook/wav2vec2-base-960h \
   --local-dir ./checkpoints/wav2vec2-base-960h
 ```
 
@@ -175,10 +175,10 @@ huggingface-cli download facebook/wav2vec2-base-960h \
 | chinese-wav2vec2-base | [Hugging Face](https://huggingface.co/TencentGameMate/chinese-wav2vec2-base), [ModelScope](https://modelscope.cn/models/TencentGameMate/chinese-wav2vec2-base) |
 
 ```bash
-huggingface-cli download Soul-AILab/LiveAct \
+hf download Soul-AILab/LiveAct \
   --local-dir ./checkpoints/LiveAct
 
-huggingface-cli download TencentGameMate/chinese-wav2vec2-base \
+hf download TencentGameMate/chinese-wav2vec2-base \
   --local-dir ./checkpoints/chinese-wav2vec2-base
 ```
 

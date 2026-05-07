@@ -108,8 +108,8 @@ conda install -c conda-forge ffmpeg==7
 ```bash
 # If you are in china mainland, run this first: export HF_ENDPOINT=https://hf-mirror.com
 pip install "huggingface_hub[cli]"
-huggingface-cli download Soul-AILab/SoulX-FlashHead-1_3B --local-dir ./models/SoulX-FlashHead-1_3B
-huggingface-cli download facebook/wav2vec2-base-960h --local-dir ./models/wav2vec2-base-960h
+hf download Soul-AILab/SoulX-FlashHead-1_3B --local-dir ./models/SoulX-FlashHead-1_3B
+hf download facebook/wav2vec2-base-960h --local-dir ./models/wav2vec2-base-960h
 ```
 
 > Runtime video parameters are read from the repo-root `cyberverse_config.yaml` under `inference.avatar.flash_head.infer_params`. FlashHead runtime toggles such as `compile_model`, `compile_vae`, and `dist_worker_main_thread` live under `inference.avatar.flash_head`. Use `--config /path/to/cyberverse_config.yaml` with `generate_video.py`, `gradio_app.py`, or `gradio_app_streaming.py` to override the default config path.
