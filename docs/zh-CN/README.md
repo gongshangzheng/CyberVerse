@@ -35,6 +35,11 @@
 - `docs/zh-CN/templates/`
   - 文档模板，保证后续 feature 文档结构一致。
 
+## 当前 Feature 文档
+
+- [PersonaAgent 与后台任务 MVP](features/2026-05-11-persona-agent-task-mvp.md)
+- [VoiceLLM 文本输入改走 Doubao 的设计与实现](features/2026-04-24-voice-llm-text-input-via-doubao.md)
+
 ## feature 文档命名建议
 
 统一使用：

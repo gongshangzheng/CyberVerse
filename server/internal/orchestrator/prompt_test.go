@@ -1,9 +1,11 @@
 package orchestrator
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/cyberverse/server/internal/agenttask"
 	"github.com/cyberverse/server/internal/character"
 )
 
@@ -63,5 +65,40 @@ func TestBuildVoiceLLMSessionConfigUsesOnlyOmniRolePrompt(t *testing.T) {
 		if strings.Contains(got.SystemPrompt, unexpected) {
 			t.Fatalf("omni prompt should not contain %q: %q", unexpected, got.SystemPrompt)
 		}
+	}
+}
+
+func TestBuildVoiceLLMSessionConfigUsesPersonaWhenAgentEnabled(t *testing.T) {
+	store, err := character.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	char, err := store.Create(&character.Character{
+		Name:          "晴天",
+		VoiceProvider: "qwen_omni",
+		VoiceType:     "Tina",
+		SystemPrompt:  "你和用户像熟悉的朋友。",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	taskRoot := t.TempDir()
+	taskStore, err := agenttask.OpenStore(filepath.Join(taskRoot, "tasks.db"), filepath.Join(taskRoot, "artifacts"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer taskStore.Close()
+
+	orch := New(nil, nil, nil, nil, store)
+	orch.SetTaskService(agenttask.NewService(taskStore, nil, agenttask.Config{Enabled: true}))
+	session := NewSession("s1", ModeOmni, char.ID)
+
+	got := orch.buildVoiceLLMSessionConfig(session, "s1")
+	if got.Provider != "persona" {
+		t.Fatalf("expected persona provider, got %q", got.Provider)
+	}
+	if !orch.sessionSupportsVisualInput(session) {
+		t.Fatal("expected qwen_omni visual support to use the underlying character provider")
 	}
 }

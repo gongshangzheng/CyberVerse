@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cyberverse/server/internal/agenttask"
 	"github.com/cyberverse/server/internal/character"
 	"github.com/cyberverse/server/internal/config"
 	"github.com/cyberverse/server/internal/direct"
@@ -529,6 +530,7 @@ type Orchestrator struct {
 	turnServer    *direct.TURNServer
 	webrtcAPI     *webrtc.API
 	estimatorCh   <-chan cc.BandwidthEstimator
+	taskService   *agenttask.Service
 	avatarMu      sync.Mutex
 	mu            sync.RWMutex
 }
@@ -599,6 +601,10 @@ func (o *Orchestrator) SetWebRTCAPI(api *webrtc.API, estimatorCh <-chan cc.Bandw
 	o.estimatorCh = estimatorCh
 }
 
+func (o *Orchestrator) SetTaskService(taskService *agenttask.Service) {
+	o.taskService = taskService
+}
+
 // StreamingMode returns the current streaming mode.
 func (o *Orchestrator) StreamingMode() string {
 	return o.streamingMode
@@ -652,6 +658,13 @@ func qwenOmniVisualInputConfig(cfg config.VisualInputConfig) config.VisualInputC
 }
 
 func (o *Orchestrator) voiceLLMProviderForSession(session *Session) string {
+	if o.personaAgentEnabled(session) {
+		return "persona"
+	}
+	return o.characterVoiceLLMProviderForSession(session)
+}
+
+func (o *Orchestrator) characterVoiceLLMProviderForSession(session *Session) string {
 	if session == nil || session.Mode != ModeOmni {
 		return ""
 	}
@@ -666,6 +679,10 @@ func (o *Orchestrator) voiceLLMProviderForSession(session *Session) string {
 	return voiceLLMProviderOrDefault(char.VoiceProvider)
 }
 
+func (o *Orchestrator) personaAgentEnabled(session *Session) bool {
+	return o != nil && session != nil && session.Mode == ModeOmni && o.taskService != nil && o.taskService.Enabled()
+}
+
 func (o *Orchestrator) sessionSupportsVisualInput(session *Session) bool {
 	if session == nil {
 		return false
@@ -673,7 +690,7 @@ func (o *Orchestrator) sessionSupportsVisualInput(session *Session) bool {
 	if session.Mode == ModeStandard {
 		return true
 	}
-	return session.Mode == ModeOmni && o.voiceLLMProviderForSession(session) == "qwen_omni"
+	return session.Mode == ModeOmni && o.characterVoiceLLMProviderForSession(session) == "qwen_omni"
 }
 
 func (o *Orchestrator) VisualInputConfigForSession(session *Session) (config.VisualInputConfig, bool) {
@@ -1329,6 +1346,9 @@ func (o *Orchestrator) buildVoiceLLMSessionConfig(session *Session, sessionID st
 	if session.CharacterID != "" && o.charStore != nil {
 		if char, err := o.charStore.Get(session.CharacterID); err == nil {
 			voiceConfig.Provider = voiceLLMProviderOrDefault(char.VoiceProvider)
+			if o.personaAgentEnabled(session) {
+				voiceConfig.Provider = "persona"
+			}
 			voiceConfig.SystemPrompt = char.SystemPrompt
 			voiceConfig.Voice = char.VoiceType
 			voiceConfig.BotName = char.Name
@@ -1337,6 +1357,9 @@ func (o *Orchestrator) buildVoiceLLMSessionConfig(session *Session, sessionID st
 		} else {
 			log.Printf("buildVoiceLLMSessionConfig: could not fetch character %s: %v", session.CharacterID, err)
 		}
+	}
+	if o.personaAgentEnabled(session) {
+		voiceConfig.Provider = "persona"
 	}
 	for _, item := range session.DialogContextSnapshot() {
 		voiceConfig.DialogContext = append(voiceConfig.DialogContext, inference.VoiceLLMDialogContextItem{
@@ -1351,6 +1374,8 @@ func (o *Orchestrator) buildVoiceLLMSessionConfig(session *Session, sessionID st
 func voiceLLMProviderOrDefault(provider string) string {
 	provider = strings.ToLower(strings.TrimSpace(provider))
 	switch provider {
+	case "persona":
+		return "persona"
 	case "qwen_omni":
 		return "qwen_omni"
 	default:
@@ -1592,6 +1617,153 @@ func (o *Orchestrator) handleVoiceLLMTextInput(ctx context.Context, session *Ses
 	return nil
 }
 
+type agentTaskIntent int
+
+const (
+	agentTaskIntentChat agentTaskIntent = iota
+	agentTaskIntentCreate
+	agentTaskIntentStatus
+	agentTaskIntentCancel
+)
+
+func classifyAgentTaskIntent(text string) agentTaskIntent {
+	normalized := strings.ToLower(strings.TrimSpace(text))
+	if normalized == "" {
+		return agentTaskIntentChat
+	}
+	if containsAny(normalized, "取消", "停止", "不用查", "别查", "cancel", "stop") {
+		return agentTaskIntentCancel
+	}
+	if containsAny(normalized, "怎么样", "进度", "查到", "做到哪", "做到哪儿", "情况", "status", "progress") {
+		return agentTaskIntentStatus
+	}
+	if containsAny(normalized, "查", "搜索", "搜", "找", "整理", "研究", "调研", "报告", "热门", "热点", "有哪些", "知乎", "微博", "新闻") {
+		return agentTaskIntentCreate
+	}
+	return agentTaskIntentChat
+}
+
+func containsAny(text string, needles ...string) bool {
+	for _, needle := range needles {
+		if needle != "" && strings.Contains(text, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func (o *Orchestrator) maybeHandleAgentTaskInput(ctx context.Context, session *Session, sessionID string, text string) (bool, error) {
+	if o.taskService == nil || !o.taskService.Enabled() {
+		return false, nil
+	}
+	if o.personaAgentEnabled(session) {
+		return false, nil
+	}
+	intent := classifyAgentTaskIntent(text)
+	if intent == agentTaskIntentChat {
+		return false, nil
+	}
+
+	o.stopPipelineAndWait(session, sessionID, session.Mode == ModeOmni)
+	turnSeq := session.MarkTurnStarted()
+	o.advancePlaybackEpoch(sessionID, turnSeq)
+	session.AddMessage(ChatMessage{Role: "user", Content: text, TurnSeq: turnSeq})
+	if _, err := o.persistSessionConversation(session); err != nil {
+		log.Printf("conversation: SaveConversation task user message error session=%s: %v", sessionID, err)
+	}
+
+	switch intent {
+	case agentTaskIntentCreate:
+		task, err := o.taskService.CreateTask(ctx, agenttask.CreateTaskInput{
+			SessionID:   sessionID,
+			CharacterID: session.CharacterID,
+			Kind:        "research",
+			UserRequest: text,
+		})
+		if err != nil {
+			_ = o.SpeakAssistantText(context.Background(), sessionID, "这个任务我没能创建成功："+err.Error(), true)
+			return true, nil
+		}
+		reply := "好的，我现在开始处理“" + task.Title + "”，有进展会马上告诉你。"
+		_ = o.SpeakAssistantText(context.Background(), sessionID, reply, true)
+		return true, nil
+	case agentTaskIntentStatus:
+		task, err := o.taskService.LatestActiveTask(ctx, sessionID)
+		if errors.Is(err, agenttask.ErrNotFound) {
+			_ = o.SpeakAssistantText(context.Background(), sessionID, "现在没有正在执行的后台任务。", true)
+			return true, nil
+		}
+		if err != nil {
+			_ = o.SpeakAssistantText(context.Background(), sessionID, "我暂时查不到任务进度："+err.Error(), true)
+			return true, nil
+		}
+		events, _ := o.taskService.RecentEventsSummary(ctx, task.ID, 0, 200)
+		_ = o.SpeakAssistantText(context.Background(), sessionID, taskStatusReply(task, events), true)
+		return true, nil
+	case agentTaskIntentCancel:
+		task, err := o.taskService.LatestActiveTask(ctx, sessionID)
+		if errors.Is(err, agenttask.ErrNotFound) {
+			_ = o.SpeakAssistantText(context.Background(), sessionID, "现在没有需要取消的后台任务。", true)
+			return true, nil
+		}
+		if err != nil {
+			_ = o.SpeakAssistantText(context.Background(), sessionID, "我暂时取消不了任务："+err.Error(), true)
+			return true, nil
+		}
+		_, err = o.taskService.CancelTask(ctx, task.ID)
+		if err != nil {
+			_ = o.SpeakAssistantText(context.Background(), sessionID, "取消任务失败："+err.Error(), true)
+			return true, nil
+		}
+		_ = o.SpeakAssistantText(context.Background(), sessionID, "好的，这个后台任务已经取消。", true)
+		return true, nil
+	default:
+		return false, nil
+	}
+}
+
+func taskStatusReply(task *agenttask.Task, events []agenttask.Event) string {
+	if task == nil {
+		return "现在没有正在执行的后台任务。"
+	}
+	latest := ""
+	for i := len(events) - 1; i >= 0; i-- {
+		if msg := strings.TrimSpace(events[i].Message); msg != "" {
+			latest = msg
+			break
+		}
+	}
+	if latest == "" {
+		latest = "后台任务正在推进中。"
+	}
+	return fmt.Sprintf("“%s”现在是 %s，进度大约 %d%%。%s", task.Title, task.Status, task.Progress, latest)
+}
+
+func (o *Orchestrator) HandleTaskEvent(task *agenttask.Task, event *agenttask.Event) {
+	if o == nil || task == nil || event == nil {
+		return
+	}
+	if event.Status == agenttask.StatusCompleted {
+		msg := strings.TrimSpace(event.Message)
+		if msg == "" {
+			msg = "任务已经完成，我把整理好的资料放在聊天里了。"
+		} else {
+			msg = "任务已经完成。" + msg
+		}
+		_ = o.SpeakAssistantText(context.Background(), task.SessionID, msg, true)
+		return
+	}
+	if event.Status == agenttask.StatusFailed {
+		msg := strings.TrimSpace(event.Message)
+		if msg == "" {
+			msg = "后台任务失败了，我暂时拿不到结果。"
+		} else {
+			msg = "后台任务失败了：" + msg
+		}
+		_ = o.SpeakAssistantText(context.Background(), task.SessionID, msg, true)
+	}
+}
+
 // HandleTextInput processes a text message through either the standard
 // LLM→TTS→Avatar pipeline or the omni text-query path.
 func (o *Orchestrator) HandleTextInput(ctx context.Context, sessionID string, text string) error {
@@ -1604,6 +1776,9 @@ func (o *Orchestrator) HandleTextInput(ctx context.Context, sessionID string, te
 		return nil
 	}
 
+	if handled, err := o.maybeHandleAgentTaskInput(ctx, session, sessionID, text); handled || err != nil {
+		return err
+	}
 	if session.Mode == ModeOmni {
 		return o.handleVoiceLLMTextInput(ctx, session, sessionID, text)
 	}
@@ -2928,6 +3103,209 @@ func (o *Orchestrator) broadcastError(sessionID, message string) {
 		"type":    "error",
 		"message": message,
 	})
+}
+
+func (o *Orchestrator) SpeakAssistantText(ctx context.Context, sessionID, text string, persist bool) error {
+	if o == nil {
+		return errors.New("orchestrator is nil")
+	}
+	session, err := o.sessionMgr.Get(sessionID)
+	if err != nil {
+		return err
+	}
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return nil
+	}
+
+	o.stopPipelineAndWait(session, sessionID, session.Mode == ModeOmni)
+	turnSeq := session.MarkTurnStarted()
+	o.advancePlaybackEpoch(sessionID, turnSeq)
+	o.broadcastJSON(sessionID, map[string]any{
+		"type":     "assistant_message",
+		"text":     text,
+		"turn_seq": turnSeq,
+	})
+	if persist {
+		session.AddMessage(ChatMessage{Role: "assistant", Content: text, TurnSeq: turnSeq})
+		if _, err := o.persistSessionConversation(session); err != nil {
+			log.Printf("conversation: SaveConversation assistant speech error session=%s: %v", sessionID, err)
+		}
+	}
+
+	if o.inference == nil {
+		return nil
+	}
+	pipeCtx, cancel := context.WithCancel(ctx)
+	session.mu.Lock()
+	session.PipelineCancel = cancel
+	session.mu.Unlock()
+	pipelineSeq := session.MarkPipelineRunning()
+	resumeOmni := session.Mode == ModeOmni
+	go func() {
+		o.runAssistantSpeechPipeline(pipeCtx, session, sessionID, text, pipelineSeq, turnSeq)
+		if resumeOmni && pipeCtx.Err() == nil && session.IsCurrentPipeline(pipelineSeq) {
+			if err := o.resumeVoiceAudioStream(sessionID); err != nil {
+				log.Printf("Failed to resume omni audio stream after assistant speech for session %s: %v", sessionID, err)
+			}
+		}
+	}()
+	return nil
+}
+
+func (o *Orchestrator) runAssistantSpeechPipeline(ctx context.Context, session *Session, sessionID, text string, pipelineSeq uint64, turnSeq uint64) {
+	defer func() {
+		session.MarkPipelineFinished(pipelineSeq)
+		if session.IsCurrentPipeline(pipelineSeq) {
+			session.SetState(StateListening)
+			o.broadcastStatusTurn(sessionID, "idle", turnSeq)
+		}
+	}()
+
+	session.SetState(StateProcessing)
+	o.broadcastStatusTurn(sessionID, "processing", turnSeq)
+
+	components, voice, speakingStyle, language := o.standardCharacterConfig(session)
+	textCh := make(chan string, 1)
+	textCh <- text
+	close(textCh)
+	ttsAudioCh, ttsErrCh := o.inference.SynthesizeSpeechStream(ctx, textCh, inference.TTSConfig{
+		Provider:      components.TTS,
+		Voice:         voice,
+		SpeakingStyle: speakingStyle,
+		Language:      language,
+		SessionID:     sessionID,
+	})
+
+	syncBuf := newVoiceAVSyncBuffer(voiceMaxPCMBufferSamples)
+	avatarAudioCh := make(chan *pb.AudioChunk, 8)
+	go func() {
+		defer close(avatarAudioCh)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case chunk, ok := <-ttsAudioCh:
+				if !ok {
+					return
+				}
+				pcm, sampleRate := audioChunkToPCM16(chunk)
+				if len(pcm) > 0 {
+					_ = syncBuf.appendPCM(pcm, sampleRate)
+				}
+				select {
+				case avatarAudioCh <- chunk:
+				case <-ctx.Done():
+					return
+				}
+			case err, ok := <-ttsErrCh:
+				if !ok {
+					ttsErrCh = nil
+					continue
+				}
+				if err != nil {
+					log.Printf("assistant speech TTS error for session %s: %v", sessionID, err)
+					o.broadcastError(sessionID, "Speech synthesis failed")
+					return
+				}
+			}
+		}
+	}()
+
+	lookupPeer := func() mediapeer.MediaPeer {
+		o.mu.RLock()
+		defer o.mu.RUnlock()
+		return o.peers[sessionID]
+	}
+
+	o.avatarMu.Lock()
+	defer o.avatarMu.Unlock()
+	videoCh, videoErrCh := o.inference.GenerateAvatarStream(ctx, avatarAudioCh)
+
+	var (
+		segVideo       []byte
+		segFrames      int
+		segWidth       int
+		segHeight      int
+		segFPS         int
+		segCount       int
+		segSeq         int64
+		firstFrameSent bool
+	)
+	flushSeg := func(isFinalSeg bool) {
+		if segCount == 0 {
+			return
+		}
+		segSeq++
+		if peer := lookupPeer(); peer != nil {
+			segPCM, _, _, _ := syncBuf.takeSegmentPCM(segFrames, segFPS, isFinalSeg)
+			_, _, _, sampleRate := syncBuf.snapshot()
+			if sampleRate <= 0 {
+				sampleRate = 16000
+			}
+			raw := &mediapeer.RawAVSegment{
+				TraceLabel: voiceTraceLabel(sessionID, turnSeq, "task", "", segSeq),
+				Epoch:      turnSeq,
+				RGB:        segVideo,
+				PCM:        segPCM,
+				SampleRate: sampleRate,
+				Width:      segWidth,
+				Height:     segHeight,
+				FPS:        segFPS,
+				NumFrames:  segFrames,
+			}
+			if err := peer.SendAVSegment(raw); err != nil {
+				log.Printf("assistant speech SendAVSegment failed session=%s: %v", sessionID, err)
+			}
+		}
+		segVideo = nil
+		segFrames = 0
+		segCount = 0
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			flushSeg(false)
+			return
+		case chunk, ok := <-videoCh:
+			if !ok {
+				flushSeg(true)
+				if err := <-videoErrCh; err != nil {
+					log.Printf("assistant speech avatar error for session %s: %v", sessionID, err)
+					o.broadcastError(sessionID, "Avatar generation failed")
+				}
+				if ctx.Err() == nil {
+					if peer := lookupPeer(); peer != nil {
+						peer.WaitAVDrain(10 * time.Second)
+					}
+				}
+				return
+			}
+			nf := int(chunk.GetNumFrames())
+			if nf <= 0 && int(chunk.GetWidth())*int(chunk.GetHeight())*3 > 0 {
+				nf = len(chunk.GetData()) / (int(chunk.GetWidth()) * int(chunk.GetHeight()) * 3)
+			}
+			fps := int(chunk.GetFps())
+			if fps <= 0 {
+				fps = 25
+			}
+			if !firstFrameSent {
+				firstFrameSent = true
+				session.SetState(StateSpeaking)
+				o.broadcastStatusTurn(sessionID, "speaking", turnSeq)
+			}
+			segVideo = append(segVideo, chunk.GetData()...)
+			segFrames += nf
+			segWidth = int(chunk.GetWidth())
+			segHeight = int(chunk.GetHeight())
+			segFPS = fps
+			segCount++
+			if segCount >= stdChunksPerSegment || chunk.GetIsFinal() {
+				flushSeg(chunk.GetIsFinal())
+			}
+		}
+	}
 }
 
 // PersistSessionConversation writes the current session history to session.json.

@@ -1,5 +1,5 @@
 import { ref, computed } from 'vue'
-import { getConversationMessages, sendMessage } from '../services/api'
+import { getConversationMessages, getTaskEvents, listSessionTasks, sendMessage } from '../services/api'
 import { translate } from '../i18n'
 
 export interface ChatMessage {
@@ -9,6 +9,7 @@ export interface ChatMessage {
   timestamp: number
   isHistory?: boolean
   sessionId?: string
+  artifactUrl?: string
 }
 
 export type AvatarStatus = 'idle' | 'speaking' | 'processing'
@@ -26,6 +27,7 @@ export function useChat(sessionId: () => string) {
 
   const latestTurnSeq = ref(0)
   const voiceDrafts = new Map<string, string>()
+  const lastTaskSeqByTaskId = new Map<string, number>()
 
   // Computed property to show the appropriate response based on active pipeline
   const currentLLMResponse = computed(() => {
@@ -99,6 +101,49 @@ export function useChat(sessionId: () => string) {
     signalingHandler = fn
   }
 
+  function handleTaskEvent(data: any, fallbackTask?: any) {
+    const task = data.task || fallbackTask || {}
+    const taskId = data.task_id || task.id || ''
+    const seq = Number(data.seq ?? 0)
+    if (taskId && Number.isFinite(seq) && seq > 0) {
+      const previousSeq = lastTaskSeqByTaskId.get(taskId) || 0
+      if (seq <= previousSeq) return
+      lastTaskSeqByTaskId.set(taskId, seq)
+    }
+    const title = task.title || '后台任务'
+    const status = data.status || task.status || ''
+    const progress = Number(data.progress ?? task.progress ?? 0)
+    const message = data.message || '任务状态已更新。'
+    const payload = data.payload || {}
+    const artifactId = payload.artifact_id
+    const artifactUrl = taskId && artifactId ? `/api/v1/tasks/${taskId}/artifacts/${artifactId}` : undefined
+    const suffix = artifactUrl ? '\n资料已生成。' : ''
+    upsertMessage({
+      id: taskId ? `task-${taskId}` : `task-${Date.now()}`,
+      role: 'system',
+      content: `任务「${title}」${status}，进度 ${progress}%：${message}${suffix}`,
+      timestamp: Date.now(),
+      artifactUrl,
+    })
+  }
+
+  async function recoverTaskEvents() {
+    const sid = sessionId()
+    if (!sid) return
+    try {
+      const resp = await listSessionTasks(sid)
+      await Promise.all((resp.tasks || []).map(async (task) => {
+        const afterSeq = lastTaskSeqByTaskId.get(task.id) || 0
+        const eventsResp = await getTaskEvents(task.id, afterSeq)
+        for (const event of eventsResp.events || []) {
+          handleTaskEvent(event, task)
+        }
+      }))
+    } catch (err) {
+      console.warn('[useChat] Failed to recover task events:', err)
+    }
+  }
+
   function sendSignaling(msg: any) {
     if (!ws.value || ws.value.readyState !== WebSocket.OPEN) return
     ws.value.send(JSON.stringify(msg))
@@ -118,6 +163,7 @@ export function useChat(sessionId: () => string) {
 
       ws.value.onopen = () => {
         isConnected.value = true
+        void recoverTaskEvents()
         resolve()
       }
 
@@ -226,6 +272,24 @@ export function useChat(sessionId: () => string) {
             currentTextResponse.value = ''
             clearActiveResponse(responseId)
           }
+          break
+        }
+
+        case 'assistant_message': {
+          const turnSeq = parseTurnSeq(data)
+          if (!isOlderTurn(turnSeq)) beginTurnSeq(turnSeq)
+          const responseId = turnSeq ? `assistant-message-${turnSeq}` : `assistant-message-${Date.now()}`
+          upsertMessage({
+            id: responseId,
+            role: 'assistant',
+            content: data.text || data.message || '',
+            timestamp: Date.now(),
+          })
+          break
+        }
+
+        case 'task_event': {
+          handleTaskEvent(data)
           break
         }
 

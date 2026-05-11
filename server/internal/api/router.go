@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"path/filepath"
 
+	"github.com/cyberverse/server/internal/agenttask"
 	"github.com/cyberverse/server/internal/character"
 	"github.com/cyberverse/server/internal/config"
 	"github.com/cyberverse/server/internal/livekit"
@@ -16,6 +17,7 @@ type Router struct {
 	orch       *orchestrator.Orchestrator
 	wsHub      *ws.Hub
 	roomMgr    *livekit.RoomManager
+	taskSvc    *agenttask.Service
 	cfg        *config.Config
 	charStore  *character.Store
 	envPath    string
@@ -33,6 +35,7 @@ func NewRouter(
 	charStore *character.Store,
 	envPath string,
 	configPath string,
+	taskServices ...*agenttask.Service,
 ) *Router {
 	r := &Router{
 		sessionMgr: sessionMgr,
@@ -46,6 +49,9 @@ func NewRouter(
 		modelsDir:  filepath.Join(filepath.Dir(configPath), "models"),
 		mux:        http.NewServeMux(),
 	}
+	if len(taskServices) > 0 {
+		r.taskSvc = taskServices[0]
+	}
 	r.registerRoutes()
 	return r
 }
@@ -56,7 +62,15 @@ func (r *Router) registerRoutes() {
 	r.mux.HandleFunc("POST /api/v1/sessions", r.handleCreateSession)
 	r.mux.HandleFunc("DELETE /api/v1/sessions/{id}", r.handleDeleteSession)
 	r.mux.HandleFunc("POST /api/v1/sessions/{id}/message", r.handleSendMessage)
+	r.mux.HandleFunc("POST /api/v1/sessions/{id}/tasks", r.handleCreateTask)
+	r.mux.HandleFunc("GET /api/v1/sessions/{id}/tasks", r.handleListSessionTasks)
 	r.mux.HandleFunc("GET /api/v1/sessions", r.handleListSessions)
+	r.mux.HandleFunc("GET /api/v1/tasks/{task_id}", r.handleGetTask)
+	r.mux.HandleFunc("GET /api/v1/tasks/{task_id}/events", r.handleListTaskEvents)
+	r.mux.HandleFunc("POST /api/v1/tasks/{task_id}/cancel", r.handleCancelTask)
+	r.mux.HandleFunc("GET /api/v1/tasks/{task_id}/artifacts/{artifact_id}", r.handleGetTaskArtifact)
+	r.mux.HandleFunc("POST /api/v1/internal/tasks/{task_id}/events", r.handleInternalTaskEvent)
+	r.mux.HandleFunc("POST /api/v1/internal/tasks/{task_id}/artifacts", r.handleInternalTaskArtifact)
 	r.mux.HandleFunc("GET /ws/chat/{id}", r.handleWebSocket)
 
 	// Character CRUD

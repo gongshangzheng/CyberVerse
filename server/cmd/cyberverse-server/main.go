@@ -8,10 +8,11 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"syscall"
 
-	"path/filepath"
-
+	"github.com/cyberverse/server/internal/agenttask"
 	"github.com/cyberverse/server/internal/api"
 	"github.com/cyberverse/server/internal/character"
 	"github.com/cyberverse/server/internal/config"
@@ -66,9 +67,31 @@ func main() {
 		log.Fatalf("Failed to init character store: %v", err)
 	}
 
+	taskDBPath := filepath.Join(dataDir, "tasks", "tasks.db")
+	artifactDir := filepath.Join(dataDir, "tasks", "artifacts")
+	taskStore, err := agenttask.OpenStore(taskDBPath, artifactDir)
+	if err != nil {
+		log.Fatalf("Failed to init agent task store: %v", err)
+	}
+	workerURL := strings.TrimSpace(os.Getenv("AGENT_WORKER_URL"))
+	if workerURL == "" {
+		workerURL = "http://localhost:8090"
+	}
+	taskSvc := agenttask.NewService(taskStore, wsHub, agenttask.Config{
+		Enabled:                  true,
+		WorkerURL:                workerURL,
+		InternalToken:            strings.TrimSpace(os.Getenv("AGENT_INTERNAL_TOKEN")),
+		MaxActiveTasksPerSession: 3,
+	})
+	log.Printf("Agent task service enabled by default: db=%s worker=%s", taskDBPath, workerURL)
+
 	// Create orchestrator (needs charStore for recording paths)
 	recorder := recording.NewVideoRecorder(cfg.Recording)
 	orch := orchestrator.New(inferenceClient, wsHub, sessionMgr, recorder, charStore, cfg.Pipeline)
+	if taskSvc != nil {
+		orch.SetTaskService(taskSvc)
+		taskSvc.SetEventHandler(orch.HandleTaskEvent)
+	}
 
 	// Embedded TURN-over-TCP server for NAT traversal (AutoDL, SSH tunnel, etc.)
 	var turnServer *direct.TURNServer
@@ -131,7 +154,7 @@ func main() {
 	}
 
 	// Create router with all dependencies
-	router := api.NewRouter(sessionMgr, orch, wsHub, roomMgr, cfg, charStore, envPath, *configPath)
+	router := api.NewRouter(sessionMgr, orch, wsHub, roomMgr, cfg, charStore, envPath, *configPath, taskSvc)
 
 	addr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.HTTPPort)
 	srv := &http.Server{
@@ -162,6 +185,10 @@ func main() {
 		// Stop session manager cleanup
 		sessionMgr.Stop()
 
+		if taskStore != nil {
+			taskStore.Close()
+		}
+
 		srv.Close()
 	}()
 
@@ -172,4 +199,14 @@ func main() {
 	if err := srv.ListenAndServe(); err != http.ErrServerClosed {
 		log.Fatalf("Server error: %v", err)
 	}
+}
+
+func resolveConfigPath(configDir, value, fallback string) string {
+	if value == "" {
+		return fallback
+	}
+	if filepath.IsAbs(value) {
+		return value
+	}
+	return filepath.Join(configDir, value)
 }

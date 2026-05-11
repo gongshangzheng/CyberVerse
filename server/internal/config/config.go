@@ -125,7 +125,7 @@ func Load(path string) (*Config, error) {
 		cfg.Session.MaxConcurrent = 4
 	}
 	if cfg.Pipeline.DefaultMode == "" {
-		cfg.Pipeline.DefaultMode = "standard"
+		cfg.Pipeline.DefaultMode = "omni"
 	}
 	if cfg.Pipeline.DefaultMode == "voice_llm" {
 		cfg.Pipeline.DefaultMode = "omni"

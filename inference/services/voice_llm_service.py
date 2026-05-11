@@ -59,14 +59,19 @@ class VoiceLLMGRPCService(voice_llm_pb2_grpc.VoiceLLMServiceServicer):
         provider = provider.strip()
         if provider:
             try:
-                plugin = self.registry.get(f"omni.{provider}")
+                plugin = self.registry.get(f"persona.{provider}")
             except KeyError:
                 try:
-                    plugin = self.registry.get(f"voice_llm.{provider}")
+                    plugin = self.registry.get(f"omni.{provider}")
                 except KeyError:
-                    plugin = None
+                    try:
+                        plugin = self.registry.get(f"voice_llm.{provider}")
+                    except KeyError:
+                        plugin = None
         else:
-            plugin = self.registry.get_by_category("omni")
+            plugin = self.registry.get_by_category("persona")
+            if plugin is None:
+                plugin = self.registry.get_by_category("omni")
             if plugin is None:
                 plugin = self.registry.get_by_category("voice_llm")
         if plugin is None:

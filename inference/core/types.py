@@ -72,6 +72,28 @@ class TTSRequestConfig:
 
 
 @dataclass
+class ToolCall:
+    id: str
+    name: str
+    arguments: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ToolResult:
+    id: str
+    name: str
+    result: dict[str, Any] = field(default_factory=dict)
+    suppress_response: bool = False
+
+
+@dataclass
+class ToolDefinition:
+    name: str
+    description: str = ""
+    parameters: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class VoiceLLMOutputEvent:
     audio: AudioChunk | None = None
     transcript: str = ""
@@ -80,6 +102,7 @@ class VoiceLLMOutputEvent:
     question_id: str = ""
     reply_id: str = ""
     barge_in: bool = False
+    tool_calls: list[ToolCall] = field(default_factory=list)
 
 
 @dataclass
@@ -87,6 +110,7 @@ class VoiceLLMInputEvent:
     audio: bytes = b""
     text: str = ""
     image: ImageFrame | None = None
+    tool_result: ToolResult | None = None
 
 
 @dataclass
@@ -108,6 +132,7 @@ class VoiceLLMSessionConfig:
     welcome_message: str | None = None
     input_mode: str = ""
     dialog_context: list[VoiceLLMDialogContextItem] = field(default_factory=list)
+    tools: list[ToolDefinition] = field(default_factory=list)
 
 
 @dataclass

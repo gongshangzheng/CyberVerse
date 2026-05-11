@@ -147,3 +147,63 @@ def test_build_plugin_config_does_not_pass_root_warmup_to_non_avatar_plugins():
     assert plugin_config.plugin_name == "llm.openai"
     assert plugin_config.params == {"model": "gpt-4o"}
     assert plugin_config.shared == {}
+
+
+def test_build_plugin_config_passes_omni_models_to_persona_plugins():
+    config = {
+        "inference": {
+            "omni": {
+                "qwen_omni": {
+                    "plugin_class": "pkg.Qwen",
+                    "model": "qwen3.5-omni-flash-realtime",
+                }
+            },
+            "persona": {
+                "persona": {
+                    "plugin_class": "pkg.Persona",
+                    "model_provider": "qwen_omni",
+                }
+            },
+        }
+    }
+    server = _make_server(config)
+
+    plugin_config = server._build_plugin_config(
+        "persona",
+        "persona.persona",
+        config["inference"]["persona"]["persona"],
+    )
+
+    assert plugin_config.plugin_name == "persona.persona"
+    assert plugin_config.params == {"model_provider": "qwen_omni"}
+    assert plugin_config.shared["omni"] == config["inference"]["omni"]
+
+
+def test_agent_worker_settings_default_to_embedded_endpoint():
+    server = _make_server({"inference": {}})
+
+    assert server._agent_worker_settings() == {
+        "enabled": True,
+        "host": "127.0.0.1",
+        "port": 8090,
+    }
+
+
+def test_agent_worker_settings_can_be_disabled():
+    server = _make_server(
+        {
+            "inference": {
+                "agent_worker": {
+                    "enabled": False,
+                    "host": "0.0.0.0",
+                    "port": 9009,
+                }
+            }
+        }
+    )
+
+    assert server._agent_worker_settings() == {
+        "enabled": False,
+        "host": "0.0.0.0",
+        "port": 9009,
+    }

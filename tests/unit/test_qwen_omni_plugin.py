@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -9,6 +10,8 @@ import pytest
 from inference.core.types import (
     ImageFrame,
     PluginConfig,
+    ToolDefinition,
+    ToolResult,
     VoiceLLMInputEvent,
     VoiceLLMSessionConfig,
 )
@@ -211,3 +214,153 @@ async def test_send_inputs_buffers_latest_image_until_first_audio():
     sent_types = [event["type"] for event in ws.sent]
     assert sent_types == ["input_audio_buffer.append", "input_image_buffer.append"]
     assert base64.b64decode(ws.sent[1]["image"]) == latest_image
+
+
+@pytest.mark.asyncio
+async def test_send_inputs_sends_text_message_and_response_create():
+    plugin = QwenOmniRealtimePlugin()
+    ws = FakeQwenWS([])
+
+    async def inputs():
+        yield VoiceLLMInputEvent(text="后台任务结果已经返回。请回复用户。")
+
+    await plugin._send_inputs(ws, inputs(), "session-1", asyncio.Queue())
+
+    sent_types = [event["type"] for event in ws.sent]
+    assert sent_types == ["conversation.item.create", "response.create"]
+    assert ws.sent[0]["item"]["type"] == "message"
+    assert ws.sent[0]["item"]["role"] == "user"
+    assert ws.sent[0]["item"]["content"] == [
+        {"type": "input_text", "text": "后台任务结果已经返回。请回复用户。"}
+    ]
+    assert ws.sent[1]["response"] == {"modalities": ["text", "audio"]}
+
+
+def test_session_payload_includes_hidden_tools():
+    plugin = QwenOmniRealtimePlugin()
+    plugin.enable_search = True
+    plugin.search_options = {"enable_source": True}
+
+    payload = plugin._session_payload(
+        VoiceLLMSessionConfig(
+            tools=[
+                ToolDefinition(
+                    name="create_task",
+                    description="Create task",
+                    parameters={"type": "object", "properties": {"user_request": {"type": "string"}}},
+                )
+            ]
+        )
+    )
+
+    assert "tool_choice" not in payload
+    assert "enable_search" not in payload
+    assert "search_options" not in payload
+    assert payload["tools"][0]["type"] == "function"
+    assert payload["tools"][0]["function"]["name"] == "create_task"
+    assert payload["tools"][0]["function"]["parameters"]["properties"]["user_request"]["type"] == "string"
+
+
+def test_session_payload_keeps_search_when_tools_absent():
+    plugin = QwenOmniRealtimePlugin()
+    plugin.enable_search = True
+    plugin.search_options = {"enable_source": True}
+
+    payload = plugin._session_payload(VoiceLLMSessionConfig())
+
+    assert payload["enable_search"] is True
+    assert payload["search_options"] == {"enable_source": True}
+
+
+def test_model_event_logs_keep_stream_deltas_out_of_info(caplog):
+    logger_name = "inference.plugins.voice_llm.qwen_omni_realtime"
+
+    with caplog.at_level(logging.INFO, logger=logger_name):
+        QwenOmniRealtimePlugin._log_server_event(
+            "session-1",
+            {"type": "response.audio_transcript.delta", "delta": "收到"},
+        )
+        QwenOmniRealtimePlugin._log_server_event(
+            "session-1",
+            {"type": "response.audio_transcript.done", "transcript": "收到"},
+        )
+        QwenOmniRealtimePlugin._log_server_event(
+            "session-1",
+            {"type": "response.audio.delta", "delta": "abcd"},
+        )
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert len(messages) == 1
+    assert "response.audio_transcript.done" in messages[0]
+    assert "收到" in messages[0]
+
+
+@pytest.mark.asyncio
+async def test_send_inputs_sends_tool_result_and_response_create():
+    plugin = QwenOmniRealtimePlugin()
+    ws = FakeQwenWS([])
+
+    async def inputs():
+        yield VoiceLLMInputEvent(
+            tool_result=ToolResult(
+                id="call-1",
+                name="create_task",
+                result={"id": "task-1", "status": "queued"},
+            )
+        )
+
+    await plugin._send_inputs(ws, inputs(), "session-1", asyncio.Queue())
+
+    sent_types = [event["type"] for event in ws.sent]
+    assert sent_types == ["conversation.item.create", "response.create"]
+    assert ws.sent[0]["item"]["type"] == "function_call_output"
+    assert ws.sent[0]["item"]["call_id"] == "call-1"
+    assert json.loads(ws.sent[0]["item"]["output"]) == {"id": "task-1", "status": "queued"}
+
+
+@pytest.mark.asyncio
+async def test_send_inputs_suppresses_response_create_for_wait_tool_result():
+    plugin = QwenOmniRealtimePlugin()
+    ws = FakeQwenWS([])
+
+    async def inputs():
+        yield VoiceLLMInputEvent(
+            tool_result=ToolResult(
+                id="wait-1",
+                name="wait_for_more_input",
+                result={"ok": True, "waiting": True},
+                suppress_response=True,
+            )
+        )
+
+    await plugin._send_inputs(ws, inputs(), "session-1", asyncio.Queue())
+
+    sent_types = [event["type"] for event in ws.sent]
+    assert sent_types == ["conversation.item.create"]
+    assert ws.sent[0]["item"]["type"] == "function_call_output"
+    assert ws.sent[0]["item"]["call_id"] == "wait-1"
+    assert json.loads(ws.sent[0]["item"]["output"]) == {"ok": True, "waiting": True}
+
+
+@pytest.mark.asyncio
+async def test_receive_events_emits_tool_call():
+    plugin = QwenOmniRealtimePlugin()
+    output_queue = asyncio.Queue()
+    ws = FakeQwenWS(
+        [
+            {
+                "type": "response.function_call_arguments.done",
+                "call_id": "call-1",
+                "name": "create_task",
+                "arguments": json.dumps({"user_request": "今天知乎有哪些热门信息"}, ensure_ascii=False),
+            }
+        ]
+    )
+
+    await plugin._receive_events(ws, "session-1", output_queue)
+
+    event = await output_queue.get()
+    assert event.tool_calls[0].id == "call-1"
+    assert event.tool_calls[0].name == "create_task"
+    assert event.tool_calls[0].arguments == {"user_request": "今天知乎有哪些热门信息"}
+    assert await output_queue.get() is None

@@ -186,7 +186,13 @@ async def test_check_voice_uses_provider_specific_plugin():
     reg = MagicMock()
     voice = MagicMock()
     voice.check_voice = AsyncMock(return_value=None)
-    reg.get = MagicMock(return_value=voice)
+
+    def get_plugin(name):
+        if name == "omni.qwen_omni":
+            return voice
+        raise KeyError(name)
+
+    reg.get = MagicMock(side_effect=get_plugin)
     reg.get_by_category = MagicMock()
 
     svc = VoiceLLMGRPCService(reg)
@@ -204,8 +210,47 @@ async def test_check_voice_uses_provider_specific_plugin():
     resp = await svc.CheckVoice(req, ctx)
 
     assert resp.ok is True
-    reg.get.assert_called_once_with("omni.qwen_omni")
+    assert reg.get.call_args_list == [
+        (("persona.qwen_omni",),),
+        (("omni.qwen_omni",),),
+    ]
     reg.get_by_category.assert_not_called()
     passed_config = voice.check_voice.await_args.kwargs["session_config"]
     assert passed_config.provider == "qwen_omni"
+    assert passed_config.voice == "Tina"
+
+
+@pytest.mark.asyncio
+async def test_check_voice_uses_persona_provider_category():
+    reg = MagicMock()
+    persona = MagicMock()
+    persona.check_voice = AsyncMock(return_value=None)
+
+    def get_plugin(name):
+        if name == "persona.persona":
+            return persona
+        raise KeyError(name)
+
+    reg.get = MagicMock(side_effect=get_plugin)
+    reg.get_by_category = MagicMock()
+
+    svc = VoiceLLMGRPCService(reg)
+
+    from inference.generated import voice_llm_pb2
+
+    req = voice_llm_pb2.CheckVoiceRequest(
+        config=voice_llm_pb2.VoiceLLMConfig(
+            provider="persona",
+            voice="Tina",
+        )
+    )
+    ctx = MagicMock()
+
+    resp = await svc.CheckVoice(req, ctx)
+
+    assert resp.ok is True
+    reg.get.assert_called_once_with("persona.persona")
+    reg.get_by_category.assert_not_called()
+    passed_config = persona.check_voice.await_args.kwargs["session_config"]
+    assert passed_config.provider == "persona"
     assert passed_config.voice == "Tina"

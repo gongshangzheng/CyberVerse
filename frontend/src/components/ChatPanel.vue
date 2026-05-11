@@ -146,7 +146,18 @@ onUnmounted(() => {
           class="message"
           :class="[msg.role, { history: msg.isHistory }]"
         >
-          <div class="message-content">{{ msg.content }}</div>
+          <div class="message-content">
+            {{ msg.content }}
+            <a
+              v-if="msg.artifactUrl"
+              class="artifact-link"
+              :href="msg.artifactUrl"
+              target="_blank"
+              rel="noreferrer"
+            >
+              打开资料
+            </a>
+          </div>
         </div>
       </template>
 
@@ -265,6 +276,15 @@ onUnmounted(() => {
   white-space: pre-wrap;
   overflow-wrap: break-word;
 }
+.artifact-link {
+  display: inline-flex;
+  margin-top: 6px;
+  color: #66d9ef;
+  text-decoration: none;
+}
+.artifact-link:hover {
+  text-decoration: underline;
+}
 .message.user {
   align-self: flex-end;
   background: #2563eb;
@@ -274,6 +294,12 @@ onUnmounted(() => {
   align-self: flex-start;
   background: #333;
   color: #eee;
+}
+.message.system {
+  align-self: center;
+  max-width: 88%;
+  background: #24303a;
+  color: #cbd5e1;
 }
 .message.history {
   opacity: 0.75;

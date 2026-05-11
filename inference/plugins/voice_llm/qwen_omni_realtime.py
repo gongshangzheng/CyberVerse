@@ -9,6 +9,8 @@ from inference.core.types import (
     AudioChunk,
     ImageFrame,
     PluginConfig,
+    ToolCall,
+    ToolResult,
     VoiceLLMInputEvent,
     VoiceLLMOutputEvent,
     VoiceLLMSessionConfig,
@@ -90,12 +92,6 @@ class QwenOmniRealtimePlugin(VoiceLLMPlugin):
         input_stream: AsyncIterator[VoiceLLMInputEvent],
         session_config: VoiceLLMSessionConfig | None = None,
     ) -> AsyncIterator[VoiceLLMOutputEvent]:
-        if session_config and session_config.input_mode == "text":
-            raise RuntimeError(
-                "Qwen Omni Realtime provider currently supports realtime audio "
-                "input only in DashScope client events; text input is not exposed."
-            )
-
         import websockets
 
         config = session_config or VoiceLLMSessionConfig()
@@ -196,12 +192,12 @@ class QwenOmniRealtimePlugin(VoiceLLMPlugin):
             pending_image: ImageFrame | None = None
             has_sent_audio = False
             async for event in input_stream:
+                if event.tool_result:
+                    await self._send_tool_result(ws, session_id, event.tool_result)
+                    continue
                 if event.text:
-                    raise RuntimeError(
-                        "Qwen Omni Realtime provider currently supports realtime "
-                        "audio input only in DashScope client events; text input is "
-                        "not exposed."
-                    )
+                    await self._send_text(ws, session_id, event.text)
+                    continue
                 if event.audio:
                     has_sent_audio = True
                     await self._send_json(
@@ -245,6 +241,56 @@ class QwenOmniRealtimePlugin(VoiceLLMPlugin):
             },
         )
 
+    async def _send_text(self, ws: Any, session_id: str, text: str) -> None:
+        await self._send_json(
+            ws,
+            {
+                "type": "conversation.item.create",
+                "event_id": self._event_id(session_id, "text"),
+                "item": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": text,
+                        }
+                    ],
+                },
+            },
+        )
+        await self._send_json(
+            ws,
+            {
+                "type": "response.create",
+                "event_id": self._event_id(session_id, "text_response"),
+                "response": {"modalities": ["text", "audio"]},
+            },
+        )
+
+    async def _send_tool_result(self, ws: Any, session_id: str, result: ToolResult) -> None:
+        await self._send_json(
+            ws,
+            {
+                "type": "conversation.item.create",
+                "event_id": self._event_id(session_id, "tool_result"),
+                "item": {
+                    "type": "function_call_output",
+                    "call_id": result.id,
+                    "output": json.dumps(result.result, ensure_ascii=False),
+                },
+            },
+        )
+        if result.suppress_response:
+            return
+        await self._send_json(
+            ws,
+            {
+                "type": "response.create",
+                "event_id": self._event_id(session_id, "tool_response"),
+            },
+        )
+
     @staticmethod
     def _valid_image(image: ImageFrame) -> bool:
         mime_type = (image.mime_type or "").lower()
@@ -262,13 +308,50 @@ class QwenOmniRealtimePlugin(VoiceLLMPlugin):
         output_queue: asyncio.Queue[VoiceLLMOutputEvent | Exception | None],
     ) -> None:
         turn_state = _QwenTurnState(session_id=session_id or "qwen_omni")
+        tool_arg_parts: dict[str, str] = {}
+        emitted_tool_calls: set[str] = set()
         try:
             async for message in ws:
                 event = self._decode_message(message)
+                self._log_server_event(session_id, event)
                 event_type = event.get("type", "")
                 if event_type == "error":
                     raise RuntimeError(self._error_message(event))
                 if event_type in {"session.created", "session.updated"}:
+                    continue
+
+                if event_type == "response.function_call_arguments.delta":
+                    call_id = str(event.get("call_id") or event.get("item_id") or "")
+                    if call_id:
+                        tool_arg_parts[call_id] = tool_arg_parts.get(call_id, "") + str(event.get("delta", "") or "")
+                    continue
+
+                if event_type == "response.function_call_arguments.done":
+                    call = self._tool_call_from_event(event, tool_arg_parts)
+                    if call and call.id not in emitted_tool_calls:
+                        emitted_tool_calls.add(call.id)
+                        await output_queue.put(
+                            VoiceLLMOutputEvent(
+                                tool_calls=[call],
+                                question_id=turn_state.question_id,
+                                reply_id=turn_state.reply_id,
+                            )
+                        )
+                    continue
+
+                if event_type == "response.output_item.done":
+                    item = event.get("item")
+                    if isinstance(item, dict) and item.get("type") == "function_call":
+                        call = self._tool_call_from_event(item, tool_arg_parts)
+                        if call and call.id not in emitted_tool_calls:
+                            emitted_tool_calls.add(call.id)
+                            await output_queue.put(
+                                VoiceLLMOutputEvent(
+                                    tool_calls=[call],
+                                    question_id=turn_state.question_id,
+                                    reply_id=turn_state.reply_id,
+                                )
+                            )
                     continue
 
                 if event_type == "input_audio_buffer.speech_started":
@@ -386,17 +469,31 @@ class QwenOmniRealtimePlugin(VoiceLLMPlugin):
                 "silence_duration_ms": self.vad_silence_duration_ms,
             },
         }
+        has_tools = bool(session_config.tools)
         optional_values: dict[str, Any] = {
-            "enable_search": self.enable_search,
-            "search_options": self.search_options,
             "temperature": self.temperature,
             "top_p": self.top_p,
             "top_k": self.top_k,
             "max_tokens": self.max_tokens,
         }
+        if not has_tools:
+            optional_values["enable_search"] = self.enable_search
+            optional_values["search_options"] = self.search_options
         for key, value in optional_values.items():
             if value is not None:
                 payload[key] = value
+        if has_tools:
+            payload["tools"] = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.parameters or {"type": "object", "properties": {}},
+                    },
+                }
+                for tool in session_config.tools
+            ]
         return payload
 
     def _instructions(self, session_config: VoiceLLMSessionConfig) -> str:
@@ -412,6 +509,110 @@ class QwenOmniRealtimePlugin(VoiceLLMPlugin):
                 role = "用户" if item.role == "user" else "助手"
                 parts.append(f"{role}：{item.text}")
         return "\n".join(part for part in parts if part.strip())
+
+    @staticmethod
+    def _tool_call_from_event(event: dict[str, Any], arg_parts: dict[str, str]) -> ToolCall | None:
+        call_id = str(event.get("call_id") or event.get("id") or event.get("item_id") or "")
+        name = str(event.get("name") or "")
+        raw_args = event.get("arguments")
+        if raw_args is None and call_id:
+            raw_args = arg_parts.get(call_id, "")
+        if not call_id or not name:
+            return None
+        return ToolCall(
+            id=call_id,
+            name=name,
+            arguments=QwenOmniRealtimePlugin._parse_tool_arguments(raw_args),
+        )
+
+    @staticmethod
+    def _parse_tool_arguments(raw: Any) -> dict[str, Any]:
+        if isinstance(raw, dict):
+            return raw
+        if raw is None:
+            return {}
+        try:
+            parsed = json.loads(str(raw))
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    @staticmethod
+    def _clip_text(value: Any, limit: int = 180) -> str:
+        text = str(value or "")
+        if len(text) <= limit:
+            return text
+        return text[:limit] + "..."
+
+    @classmethod
+    def _server_event_log_fields(cls, event: dict[str, Any]) -> dict[str, Any]:
+        event_type = str(event.get("type") or "")
+        fields: dict[str, Any] = {}
+        for key in ("response_id", "item_id", "call_id", "name", "output_index"):
+            if key in event and event.get(key) not in (None, ""):
+                fields[key] = event.get(key)
+        if event_type == "response.audio.delta":
+            fields["audio_delta_b64_len"] = len(str(event.get("delta") or ""))
+        elif event_type in {"response.audio_transcript.delta", "response.function_call_arguments.delta"}:
+            fields["delta"] = cls._clip_text(event.get("delta"))
+        if "transcript" in event:
+            fields["transcript"] = cls._clip_text(event.get("transcript"))
+        if "arguments" in event:
+            fields["arguments"] = cls._clip_text(event.get("arguments"))
+        item = event.get("item")
+        if isinstance(item, dict):
+            item_fields = {
+                key: item.get(key)
+                for key in ("type", "id", "call_id", "name")
+                if item.get(key) not in (None, "")
+            }
+            if "arguments" in item:
+                item_fields["arguments"] = cls._clip_text(item.get("arguments"))
+            fields["item"] = item_fields
+        response = event.get("response")
+        if isinstance(response, dict):
+            fields["response"] = {
+                key: response.get(key)
+                for key in ("id", "status")
+                if response.get(key) not in (None, "")
+            }
+        error = event.get("error")
+        if error:
+            fields["error"] = cls._clip_text(error)
+        return fields
+
+    @classmethod
+    def _server_event_log_level(cls, event: dict[str, Any]) -> int:
+        event_type = str(event.get("type") or "")
+        if event_type == "error":
+            return logging.ERROR
+        if event_type in {
+            "session.created",
+            "session.updated",
+            "input_audio_buffer.speech_started",
+            "conversation.item.input_audio_transcription.completed",
+            "response.created",
+            "response.audio_transcript.done",
+            "response.function_call_arguments.done",
+            "response.done",
+        }:
+            return logging.INFO
+        return logging.DEBUG
+
+    @classmethod
+    def _log_server_event(cls, session_id: str, event: dict[str, Any]) -> None:
+        event_type = str(event.get("type") or "unknown")
+        level = cls._server_event_log_level(event)
+        if not logger.isEnabledFor(level):
+            return
+        fields = cls._server_event_log_fields(event)
+        logger.log(
+            level,
+            "qwen_omni model event session=%s type=%s fields=%s",
+            session_id or "qwen_omni",
+            event_type,
+            json.dumps(fields, ensure_ascii=False, sort_keys=True),
+        )
 
     @staticmethod
     async def _send_json(ws: Any, payload: dict[str, Any]) -> None:

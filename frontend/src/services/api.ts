@@ -95,6 +95,53 @@ export async function getHealth(): Promise<HealthResponse> {
   return request('/health')
 }
 
+// ── Agent Tasks ──
+
+export interface AgentTask {
+  id: string
+  session_id: string
+  character_id?: string
+  kind: string
+  title: string
+  user_request: string
+  status: 'queued' | 'running' | 'waiting_user' | 'completed' | 'failed' | 'cancelled'
+  progress: number
+  result_summary?: string
+  created_at: string
+  updated_at: string
+  finished_at?: string
+}
+
+export interface AgentTaskEvent {
+  task_id: string
+  seq: number
+  event_type: string
+  status: AgentTask['status']
+  message?: string
+  progress: number
+  payload?: Record<string, unknown>
+  created_at: string
+}
+
+export async function createTask(sessionId: string, userRequest: string, kind = 'research', title = ''): Promise<AgentTask> {
+  return request(`/sessions/${sessionId}/tasks`, {
+    method: 'POST',
+    body: JSON.stringify({ user_request: userRequest, kind, title }),
+  })
+}
+
+export async function listSessionTasks(sessionId: string): Promise<{ tasks: AgentTask[] }> {
+  return request(`/sessions/${sessionId}/tasks`)
+}
+
+export async function getTaskEvents(taskId: string, afterSeq = 0): Promise<{ events: AgentTaskEvent[] }> {
+  return request(`/tasks/${taskId}/events?after_seq=${afterSeq}`)
+}
+
+export async function cancelTask(taskId: string): Promise<AgentTask> {
+  return request(`/tasks/${taskId}/cancel`, { method: 'POST' })
+}
+
 // ── Conversation History ──
 
 export interface ConversationMessagesResponse {

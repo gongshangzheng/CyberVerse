@@ -73,8 +73,8 @@ inference:
                 audio_cfg: 1.0
 
     omni:
-        # omni mode uses one real-time omni model for ASR + LLM + TTS.
-        default: "doubao"
+        # Real realtime omni model providers only.
+        default: "qwen_omni"
         doubao:
             plugin_class: "inference.plugins.voice_llm.doubao_realtime.DoubaoRealtimePlugin"
             access_token: "${DOUBAO_ACCESS_TOKEN}"
@@ -93,9 +93,33 @@ inference:
             vad_threshold: 0.5
             vad_silence_duration_ms: 800
 
+    persona:
+        # PersonaAgent is the orchestration layer. It wraps a concrete omni
+        # model provider and coordinates background tasks.
+        persona:
+            plugin_class: "inference.plugins.voice_llm.persona_agent.PersonaAgentPlugin"
+            # Use a provider whose adapter exposes native hidden tool calls.
+            # The qwen_omni adapter supports PersonaAgent task tools in this MVP.
+            model_provider: "qwen_omni"
+            # Defaults to data/tasks/langgraph_checkpoints.db when empty.
+            checkpoint_db_path: ""
+
+    agent_worker:
+        # The LangGraph task runtime is embedded in the inference process by
+        # default, so users do not need to start a separate worker during MVP
+        # development. Go TaskService dispatches to this HTTP endpoint.
+        enabled: true
+        host: "127.0.0.1"
+        port: 8090
+        llm:
+            # Defaults to inference.llm.default. Set this only when background
+            # tasks should use a different text LLM from the main config.
+            provider: "qwen"
+
     llm:
-        # Used by standard mode. The global system prompt is owned by the Go
-        # orchestrator; do not duplicate persona prompts here.
+        # Used by standard mode and by the embedded LangGraph Agent Worker.
+        # The global system prompt is owned by the Go orchestrator; do not
+        # duplicate persona prompts here.
         default: "qwen"
         qwen:
             plugin_class: "inference.plugins.llm.qwen_plugin.QwenLLMPlugin"

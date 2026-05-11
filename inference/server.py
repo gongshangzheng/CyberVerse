@@ -35,8 +35,8 @@ warnings.filterwarnings(
     category=UserWarning,
 )
 
-_PLUGIN_CATEGORIES = ("avatar", "llm", "tts", "asr", "omni", "voice_llm")
-_INITIALIZE_ALL_CATEGORIES = {"llm", "tts", "asr", "omni", "voice_llm"}
+_PLUGIN_CATEGORIES = ("avatar", "llm", "tts", "asr", "omni", "persona", "voice_llm")
+_INITIALIZE_ALL_CATEGORIES = {"llm", "tts", "asr", "omni", "persona", "voice_llm"}
 
 
 def _configure_process_logging() -> None:
@@ -56,6 +56,8 @@ class InferenceServer:
         self._worker_stop = asyncio.Event()
         self._stop_lock = asyncio.Lock()
         self._stopped = False
+        self._agent_worker_server = None
+        self._agent_worker_task: asyncio.Task | None = None
         self.server = grpc.aio.server(
             options=[
                 ("grpc.max_send_message_length", 50 * 1024 * 1024),
@@ -80,6 +82,10 @@ class InferenceServer:
             warmup = self.config.get("warmup")
             if isinstance(warmup, dict):
                 shared["warmup"] = warmup
+        if category in {"omni", "persona"}:
+            omni = self.config.get("inference", {}).get("omni", {})
+            if isinstance(omni, dict):
+                shared["omni"] = omni
         return PluginConfig(
             plugin_name=full_name,
             params=params,
@@ -163,6 +169,47 @@ class InferenceServer:
         health_servicer.set("", health_pb2.HealthCheckResponse.SERVING)
         health_pb2_grpc.add_HealthServicer_to_server(health_servicer, self.server)
 
+    def _agent_worker_settings(self) -> dict:
+        worker = self.config.get("inference", {}).get("agent_worker", {})
+        worker = worker if isinstance(worker, dict) else {}
+        return {
+            "enabled": worker.get("enabled", True),
+            "host": worker.get("host") or os.environ.get("AGENT_WORKER_HOST") or "127.0.0.1",
+            "port": int(worker.get("port") or os.environ.get("AGENT_WORKER_PORT") or 8090),
+        }
+
+    async def _start_agent_worker(self) -> None:
+        if not self.is_primary:
+            return
+        settings = self._agent_worker_settings()
+        if not settings["enabled"]:
+            logger.info("CyberVerse Agent Worker HTTP endpoint disabled")
+            return
+        try:
+            import uvicorn
+            from agent_runtime.server import create_app
+        except Exception:
+            logger.exception("CyberVerse Agent Worker dependencies are not available")
+            return
+
+        app = create_app(runtime_config=self.config)
+        config = uvicorn.Config(
+            app,
+            host=str(settings["host"]),
+            port=int(settings["port"]),
+            log_level="info",
+            loop="asyncio",
+        )
+        server = uvicorn.Server(config)
+        server.install_signal_handlers = lambda: None
+        self._agent_worker_server = server
+        self._agent_worker_task = asyncio.create_task(server.serve())
+        logger.info(
+            "CyberVerse Agent Worker HTTP endpoint started on %s:%s",
+            settings["host"],
+            settings["port"],
+        )
+
     async def start(self) -> None:
         self._register_plugins()
         self._register_grpc_services()
@@ -182,6 +229,7 @@ class InferenceServer:
         port = self.config.get("server", {}).get("grpc_port", 50051)
         self.server.add_insecure_port(f"[::]:{port}")
         await self.server.start()
+        await self._start_agent_worker()
         logger.info("CyberVerse Inference Server started on port %d", port)
         logger.info("Registered plugins: %s", self.registry.registered_names)
         logger.info("Initialized plugins: %s", self.registry.initialized_names)
@@ -198,6 +246,16 @@ class InferenceServer:
         if self.world_size > 1 and self.rank != 0:
             self._worker_stop.set()
             return
+        if self._agent_worker_server is not None:
+            self._agent_worker_server.should_exit = True
+        if self._agent_worker_task is not None:
+            try:
+                await asyncio.wait_for(self._agent_worker_task, timeout=5)
+            except asyncio.TimeoutError:
+                self._agent_worker_task.cancel()
+                await asyncio.gather(self._agent_worker_task, return_exceptions=True)
+            self._agent_worker_task = None
+            self._agent_worker_server = None
         await self.server.stop(grace=5)
 
 
