@@ -421,13 +421,38 @@ class PersonaAgentPlugin(VoiceLLMPlugin):
             background_tasks.add(task)
             task.add_done_callback(background_tasks.discard)
 
+        model_event_task: asyncio.Task[VoiceLLMOutputEvent] | None = None
+        task_event_task: asyncio.Task[dict[str, Any]] | None = None
         try:
-            async for event in self.model_plugin.converse_stream(
+            model_events = self.model_plugin.converse_stream(
                 self._merged_input_stream(input_stream, injected),
                 session_config=model_session_config,
-            ):
-                for payload in self._drain_task_events(task_events):
-                    yield VoiceLLMOutputEvent(task_event=payload)
+            ).__aiter__()
+            model_event_task = asyncio.create_task(model_events.__anext__())
+            task_event_task = asyncio.create_task(task_events.get())
+
+            while model_event_task is not None:
+                wait_set = {model_event_task}
+                if task_event_task is not None:
+                    wait_set.add(task_event_task)
+                done, _pending = await asyncio.wait(wait_set, return_when=asyncio.FIRST_COMPLETED)
+
+                if task_event_task is not None and task_event_task in done:
+                    yield VoiceLLMOutputEvent(task_event=task_event_task.result())
+                    for payload in self._drain_task_events(task_events):
+                        yield VoiceLLMOutputEvent(task_event=payload)
+                    task_event_task = asyncio.create_task(task_events.get())
+                    if model_event_task not in done:
+                        continue
+
+                if model_event_task not in done:
+                    continue
+
+                try:
+                    event = model_event_task.result()
+                except StopAsyncIteration:
+                    model_event_task = None
+                    break
 
                 self._log_model_event(session_config.session_id, event)
                 if event.user_transcript:
@@ -439,6 +464,7 @@ class PersonaAgentPlugin(VoiceLLMPlugin):
                     )
                     event = replace(event, user_transcript="")
                     if not event.tool_calls and not event.barge_in and not self._has_assistant_output(event):
+                        model_event_task = asyncio.create_task(model_events.__anext__())
                         continue
 
                 if event.tool_calls:
@@ -495,6 +521,7 @@ class PersonaAgentPlugin(VoiceLLMPlugin):
                         )
                     for payload in self._drain_task_events(task_events):
                         yield VoiceLLMOutputEvent(task_event=payload)
+                    model_event_task = asyncio.create_task(model_events.__anext__())
                     continue
 
                 if self._has_assistant_output(event) and (pending_partials or turn_transcripts):
@@ -507,9 +534,17 @@ class PersonaAgentPlugin(VoiceLLMPlugin):
                     pending_task_starts.clear()
                     for pending in starts:
                         schedule_task_start(pending)
+                model_event_task = asyncio.create_task(model_events.__anext__())
             for payload in self._drain_task_events(task_events):
                 yield VoiceLLMOutputEvent(task_event=payload)
         finally:
+            for task in (model_event_task, task_event_task):
+                if task is not None and not task.done():
+                    task.cancel()
+            await asyncio.gather(
+                *(task for task in (model_event_task, task_event_task) if task is not None),
+                return_exceptions=True,
+            )
             if remove_task_event_listener is not None:
                 remove_task_event_listener()
             for task in background_tasks:

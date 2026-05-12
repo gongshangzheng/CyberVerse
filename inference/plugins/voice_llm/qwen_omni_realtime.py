@@ -3,6 +3,8 @@ import base64
 import json
 import logging
 import time
+from collections import deque
+from dataclasses import dataclass
 from typing import Any, AsyncIterator
 
 from inference.core.types import (
@@ -97,6 +99,7 @@ class QwenOmniRealtimePlugin(VoiceLLMPlugin):
         config = session_config or VoiceLLMSessionConfig()
         ws = await self._connect(websockets)
         self._active_ws = ws
+        response_coordinator = _QwenResponseCoordinator()
         output_queue: asyncio.Queue[VoiceLLMOutputEvent | Exception | None] = (
             asyncio.Queue()
         )
@@ -105,10 +108,21 @@ class QwenOmniRealtimePlugin(VoiceLLMPlugin):
         try:
             await self._configure_session(ws, config)
             sender_task = asyncio.create_task(
-                self._send_inputs(ws, input_stream, config.session_id, output_queue)
+                self._send_inputs(
+                    ws,
+                    input_stream,
+                    config.session_id,
+                    output_queue,
+                    response_coordinator,
+                )
             )
             receiver_task = asyncio.create_task(
-                self._receive_events(ws, config.session_id, output_queue)
+                self._receive_events(
+                    ws,
+                    config.session_id,
+                    output_queue,
+                    response_coordinator,
+                )
             )
 
             while True:
@@ -187,16 +201,26 @@ class QwenOmniRealtimePlugin(VoiceLLMPlugin):
         input_stream: AsyncIterator[VoiceLLMInputEvent],
         session_id: str,
         output_queue: asyncio.Queue[VoiceLLMOutputEvent | Exception | None],
+        response_coordinator: "_QwenResponseCoordinator | None" = None,
     ) -> None:
+        response_coordinator = response_coordinator or _QwenResponseCoordinator()
+        response_sender_task = asyncio.create_task(
+            self._send_deferred_responses(ws, response_coordinator, output_queue)
+        )
         try:
             pending_image: ImageFrame | None = None
             has_sent_audio = False
             async for event in input_stream:
                 if event.tool_result:
-                    await self._send_tool_result(ws, session_id, event.tool_result)
+                    await self._send_tool_result(
+                        ws,
+                        session_id,
+                        event.tool_result,
+                        response_coordinator,
+                    )
                     continue
                 if event.text:
-                    await self._send_text(ws, session_id, event.text)
+                    await self._send_text(ws, session_id, event.text, response_coordinator)
                     continue
                 if event.audio:
                     has_sent_audio = True
@@ -226,6 +250,12 @@ class QwenOmniRealtimePlugin(VoiceLLMPlugin):
         except Exception as exc:
             await output_queue.put(exc)
         finally:
+            await response_coordinator.close()
+            if not response_sender_task.done():
+                try:
+                    await response_sender_task
+                except asyncio.CancelledError:
+                    pass
             try:
                 await ws.close()
             except Exception:
@@ -241,34 +271,44 @@ class QwenOmniRealtimePlugin(VoiceLLMPlugin):
             },
         )
 
-    async def _send_text(self, ws: Any, session_id: str, text: str) -> None:
-        await self._send_json(
-            ws,
-            {
-                "type": "conversation.item.create",
-                "event_id": self._event_id(session_id, "text"),
-                "item": {
-                    "type": "message",
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "input_text",
-                            "text": text,
-                        }
-                    ],
+    async def _send_text(
+        self,
+        ws: Any,
+        session_id: str,
+        text: str,
+        response_coordinator: "_QwenResponseCoordinator",
+    ) -> None:
+        await response_coordinator.enqueue(
+            _QwenDeferredResponse(
+                item_payload={
+                    "type": "conversation.item.create",
+                    "event_id": self._event_id(session_id, "text"),
+                    "item": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": text,
+                            }
+                        ],
+                    },
                 },
-            },
-        )
-        await self._send_json(
-            ws,
-            {
-                "type": "response.create",
-                "event_id": self._event_id(session_id, "text_response"),
-                "response": {"modalities": ["text", "audio"]},
-            },
+                response_payload={
+                    "type": "response.create",
+                    "event_id": self._event_id(session_id, "text_response"),
+                    "response": {"modalities": ["text", "audio"]},
+                },
+            )
         )
 
-    async def _send_tool_result(self, ws: Any, session_id: str, result: ToolResult) -> None:
+    async def _send_tool_result(
+        self,
+        ws: Any,
+        session_id: str,
+        result: ToolResult,
+        response_coordinator: "_QwenResponseCoordinator",
+    ) -> None:
         await self._send_json(
             ws,
             {
@@ -283,13 +323,49 @@ class QwenOmniRealtimePlugin(VoiceLLMPlugin):
         )
         if result.suppress_response:
             return
-        await self._send_json(
-            ws,
-            {
-                "type": "response.create",
-                "event_id": self._event_id(session_id, "tool_response"),
-            },
+        await response_coordinator.enqueue(
+            _QwenDeferredResponse(
+                response_payload={
+                    "type": "response.create",
+                    "event_id": self._event_id(session_id, "tool_response"),
+                }
+            )
         )
+
+    async def _send_deferred_responses(
+        self,
+        ws: Any,
+        response_coordinator: "_QwenResponseCoordinator",
+        output_queue: asyncio.Queue[VoiceLLMOutputEvent | Exception | None],
+    ) -> None:
+        try:
+            while True:
+                request = await response_coordinator.next_request()
+                if request is None:
+                    return
+                await self._send_deferred_response(ws, response_coordinator, request)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await output_queue.put(exc)
+
+    async def _send_deferred_response(
+        self,
+        ws: Any,
+        response_coordinator: "_QwenResponseCoordinator",
+        request: "_QwenDeferredResponse",
+    ) -> None:
+        if not await response_coordinator.wait_idle():
+            return
+        if request.item_payload is not None and not request.item_sent:
+            await self._send_json(ws, request.item_payload)
+            request.item_sent = True
+        await response_coordinator.begin_client_response(request)
+        try:
+            await self._send_json(ws, request.response_payload)
+        except Exception:
+            await response_coordinator.release_client_response(request)
+            raise
 
     @staticmethod
     def _valid_image(image: ImageFrame) -> bool:
@@ -306,7 +382,9 @@ class QwenOmniRealtimePlugin(VoiceLLMPlugin):
         ws: Any,
         session_id: str,
         output_queue: asyncio.Queue[VoiceLLMOutputEvent | Exception | None],
+        response_coordinator: "_QwenResponseCoordinator | None" = None,
     ) -> None:
+        response_coordinator = response_coordinator or _QwenResponseCoordinator()
         turn_state = _QwenTurnState(session_id=session_id or "qwen_omni")
         tool_arg_parts: dict[str, str] = {}
         emitted_tool_calls: set[str] = set()
@@ -316,7 +394,15 @@ class QwenOmniRealtimePlugin(VoiceLLMPlugin):
                 self._log_server_event(session_id, event)
                 event_type = event.get("type", "")
                 if event_type == "error":
-                    raise RuntimeError(self._error_message(event))
+                    message = self._error_message(event)
+                    if self._is_active_response_error(message):
+                        logger.info(
+                            "qwen_omni deferred response delayed by active response session=%s",
+                            session_id or "qwen_omni",
+                        )
+                        await response_coordinator.mark_active_response_error()
+                        continue
+                    raise RuntimeError(message)
                 if event_type in {"session.created", "session.updated"}:
                     continue
 
@@ -355,6 +441,7 @@ class QwenOmniRealtimePlugin(VoiceLLMPlugin):
                     continue
 
                 if event_type == "input_audio_buffer.speech_started":
+                    await response_coordinator.mark_response_started()
                     turn_state.start_next_turn()
                     await output_queue.put(
                         VoiceLLMOutputEvent(
@@ -366,6 +453,7 @@ class QwenOmniRealtimePlugin(VoiceLLMPlugin):
                     continue
 
                 if event_type == "response.created":
+                    await response_coordinator.mark_response_started()
                     response = event.get("response")
                     if isinstance(response, dict):
                         response_id = str(response.get("id", "") or "")
@@ -449,6 +537,7 @@ class QwenOmniRealtimePlugin(VoiceLLMPlugin):
                             )
                         )
                     turn_state.reset()
+                    await response_coordinator.mark_response_done()
                     continue
         except Exception as exc:
             if not getattr(ws, "closed", False):
@@ -641,6 +730,10 @@ class QwenOmniRealtimePlugin(VoiceLLMPlugin):
         return f"Qwen Omni error: {event}"
 
     @staticmethod
+    def _is_active_response_error(message: str) -> bool:
+        return "Conversation already has an active response" in message
+
+    @staticmethod
     def _optional_bool(value: Any) -> bool | None:
         if value is None:
             return None
@@ -676,6 +769,95 @@ class QwenOmniRealtimePlugin(VoiceLLMPlugin):
         if self._active_ws is not None:
             await self._active_ws.close()
             self._active_ws = None
+
+
+@dataclass
+class _QwenDeferredResponse:
+    response_payload: dict[str, Any]
+    item_payload: dict[str, Any] | None = None
+    item_sent: bool = False
+
+
+class _QwenResponseCoordinator:
+    def __init__(self) -> None:
+        self._pending: deque[_QwenDeferredResponse] = deque()
+        self._pending_condition = asyncio.Condition()
+        self._state_condition = asyncio.Condition()
+        self._idle = True
+        self._closed = False
+        self._current_response: _QwenDeferredResponse | None = None
+
+    async def enqueue(self, request: _QwenDeferredResponse) -> None:
+        async with self._pending_condition:
+            if self._closed:
+                return
+            self._pending.append(request)
+            self._pending_condition.notify()
+
+    async def _prepend(self, request: _QwenDeferredResponse) -> None:
+        async with self._pending_condition:
+            if self._closed:
+                return
+            self._pending.appendleft(request)
+            self._pending_condition.notify()
+
+    async def next_request(self) -> _QwenDeferredResponse | None:
+        async with self._pending_condition:
+            while not self._pending and not self._closed:
+                await self._pending_condition.wait()
+            if self._pending:
+                return self._pending.popleft()
+            return None
+
+    async def wait_idle(self) -> bool:
+        async with self._state_condition:
+            while not self._idle and not self._closed:
+                await self._state_condition.wait()
+            return self._idle
+
+    async def begin_client_response(self, request: _QwenDeferredResponse) -> None:
+        async with self._state_condition:
+            self._idle = False
+            self._current_response = request
+            self._state_condition.notify_all()
+
+    async def release_client_response(self, request: _QwenDeferredResponse) -> None:
+        async with self._state_condition:
+            if self._current_response is request:
+                self._current_response = None
+            self._idle = True
+            self._state_condition.notify_all()
+
+    async def mark_response_started(self) -> None:
+        async with self._state_condition:
+            self._idle = False
+            self._state_condition.notify_all()
+
+    async def mark_response_done(self) -> None:
+        async with self._state_condition:
+            self._idle = True
+            self._current_response = None
+            self._state_condition.notify_all()
+
+    async def mark_active_response_error(self) -> None:
+        retry: _QwenDeferredResponse | None = None
+        async with self._state_condition:
+            if self._current_response is not None:
+                retry = self._current_response
+                retry.item_sent = True
+                self._current_response = None
+            self._idle = False
+            self._state_condition.notify_all()
+        if retry is not None:
+            await self._prepend(retry)
+
+    async def close(self) -> None:
+        async with self._pending_condition:
+            self._closed = True
+            self._pending_condition.notify_all()
+        async with self._state_condition:
+            self._idle = True
+            self._state_condition.notify_all()
 
 
 class _QwenTurnState:

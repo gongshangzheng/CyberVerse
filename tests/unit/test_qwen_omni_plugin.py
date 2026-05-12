@@ -15,7 +15,10 @@ from inference.core.types import (
     VoiceLLMSessionConfig,
 )
 from inference.plugins.voice_llm.persona_agent import PERSONA_TOOL_DEFINITIONS
-from inference.plugins.voice_llm.qwen_omni_realtime import QwenOmniRealtimePlugin
+from inference.plugins.voice_llm.qwen_omni_realtime import (
+    QwenOmniRealtimePlugin,
+    _QwenResponseCoordinator,
+)
 
 
 class FakeQwenWS:
@@ -42,6 +45,14 @@ class FakeQwenWS:
 
     async def close(self):
         self.closed = True
+
+
+async def wait_for_sent(ws: FakeQwenWS, count: int) -> None:
+    for _ in range(50):
+        if len(ws.sent) >= count:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"expected at least {count} sent events, got {len(ws.sent)}")
 
 
 @pytest.mark.asyncio
@@ -236,6 +247,53 @@ async def test_send_inputs_sends_text_message_and_response_create():
     assert ws.sent[1]["response"] == {"modalities": ["text", "audio"]}
 
 
+@pytest.mark.asyncio
+async def test_send_inputs_defers_text_response_until_active_response_done():
+    plugin = QwenOmniRealtimePlugin()
+    ws = FakeQwenWS([])
+    response_coordinator = _QwenResponseCoordinator()
+    await response_coordinator.mark_response_started()
+    inputs_queue = asyncio.Queue()
+
+    async def inputs():
+        while True:
+            event = await inputs_queue.get()
+            if event is None:
+                return
+            yield event
+
+    sender = asyncio.create_task(
+        plugin._send_inputs(
+            ws,
+            inputs(),
+            "session-1",
+            asyncio.Queue(),
+            response_coordinator,
+        )
+    )
+
+    await inputs_queue.put(VoiceLLMInputEvent(text="后台任务结果已经返回。请回复用户。"))
+    await asyncio.sleep(0.02)
+    assert ws.sent == []
+
+    await inputs_queue.put(VoiceLLMInputEvent(audio=b"\x03\x00"))
+    await wait_for_sent(ws, 1)
+    assert [event["type"] for event in ws.sent] == ["input_audio_buffer.append"]
+
+    await response_coordinator.mark_response_done()
+    await wait_for_sent(ws, 3)
+    assert [event["type"] for event in ws.sent] == [
+        "input_audio_buffer.append",
+        "conversation.item.create",
+        "response.create",
+    ]
+    assert ws.sent[1]["item"]["role"] == "user"
+    assert ws.sent[2]["response"] == {"modalities": ["text", "audio"]}
+
+    await inputs_queue.put(None)
+    await sender
+
+
 def test_session_payload_includes_hidden_tools():
     plugin = QwenOmniRealtimePlugin()
     plugin.enable_search = True
@@ -312,6 +370,100 @@ async def test_send_inputs_sends_tool_result_and_response_create():
     assert ws.sent[0]["item"]["type"] == "function_call_output"
     assert ws.sent[0]["item"]["call_id"] == "call-1"
     assert json.loads(ws.sent[0]["item"]["output"]) == {"id": "task-1", "status": "queued"}
+
+
+@pytest.mark.asyncio
+async def test_send_inputs_sends_tool_output_immediately_but_defers_response_create():
+    plugin = QwenOmniRealtimePlugin()
+    ws = FakeQwenWS([])
+    response_coordinator = _QwenResponseCoordinator()
+    await response_coordinator.mark_response_started()
+    inputs_queue = asyncio.Queue()
+
+    async def inputs():
+        while True:
+            event = await inputs_queue.get()
+            if event is None:
+                return
+            yield event
+
+    sender = asyncio.create_task(
+        plugin._send_inputs(
+            ws,
+            inputs(),
+            "session-1",
+            asyncio.Queue(),
+            response_coordinator,
+        )
+    )
+
+    await inputs_queue.put(
+        VoiceLLMInputEvent(
+            tool_result=ToolResult(
+                id="call-1",
+                name="create_task",
+                result={"id": "task-1", "status": "queued"},
+            )
+        )
+    )
+    await wait_for_sent(ws, 1)
+    assert [event["type"] for event in ws.sent] == ["conversation.item.create"]
+    assert ws.sent[0]["item"]["type"] == "function_call_output"
+
+    await response_coordinator.mark_response_done()
+    await wait_for_sent(ws, 2)
+    assert [event["type"] for event in ws.sent] == [
+        "conversation.item.create",
+        "response.create",
+    ]
+
+    await inputs_queue.put(None)
+    await sender
+
+
+@pytest.mark.asyncio
+async def test_active_response_error_retries_response_create_without_duplicate_item():
+    plugin = QwenOmniRealtimePlugin()
+    ws = FakeQwenWS([])
+    response_coordinator = _QwenResponseCoordinator()
+    inputs_queue = asyncio.Queue()
+
+    async def inputs():
+        while True:
+            event = await inputs_queue.get()
+            if event is None:
+                return
+            yield event
+
+    sender = asyncio.create_task(
+        plugin._send_inputs(
+            ws,
+            inputs(),
+            "session-1",
+            asyncio.Queue(),
+            response_coordinator,
+        )
+    )
+
+    await inputs_queue.put(VoiceLLMInputEvent(text="后台任务结果已经返回。请回复用户。"))
+    await wait_for_sent(ws, 2)
+    await response_coordinator.mark_active_response_error()
+    await asyncio.sleep(0.02)
+    assert [event["type"] for event in ws.sent] == [
+        "conversation.item.create",
+        "response.create",
+    ]
+
+    await response_coordinator.mark_response_done()
+    await wait_for_sent(ws, 3)
+    assert [event["type"] for event in ws.sent] == [
+        "conversation.item.create",
+        "response.create",
+        "response.create",
+    ]
+
+    await inputs_queue.put(None)
+    await sender
 
 
 @pytest.mark.asyncio

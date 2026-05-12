@@ -526,6 +526,15 @@ async def test_persona_agent_projects_local_task_events(tmp_path, monkeypatch):
     assert all(event["type"] == "task_event" for event in task_events)
     assert all(event["session_id"] == "session-1" for event in task_events)
     assert any((event.get("payload") or {}).get("artifact_id") for event in task_events)
+    completed_index = next(
+        i
+        for i, event in enumerate(outputs)
+        if event.task_event and event.task_event["event_type"] == "task.completed"
+    )
+    final_voice_index = next(
+        i for i, event in enumerate(outputs) if event.transcript == "查好了，资料已经整理好。"
+    )
+    assert completed_index < final_voice_index
 
 
 @pytest.mark.asyncio
