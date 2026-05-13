@@ -33,6 +33,14 @@ type fakeInferenceService struct {
 	checkVoiceErr           error
 	checkVoiceConfigs       chan inference.VoiceLLMSessionConfig
 	voiceConfigs            chan inference.VoiceLLMSessionConfig
+	ragIndexRequests        chan inference.RAGIndexSourceRequest
+	ragDeleteRequests       chan string
+	ragSearchRequests       chan inference.RAGSearchRequest
+	ragIndexChunkCount      int
+	ragIndexErr             error
+	ragDeleteErr            error
+	ragSearchResults        []inference.RAGSearchResult
+	ragSearchErr            error
 }
 
 func (f *fakeInferenceService) HealthCheck(ctx context.Context) error {
@@ -118,6 +126,45 @@ func (f *fakeInferenceService) ConverseStream(_ context.Context, _ <-chan infere
 }
 func (f *fakeInferenceService) Interrupt(context.Context, string) error { return nil }
 func (f *fakeInferenceService) Close() error                            { return nil }
+
+func (f *fakeInferenceService) IndexRAGSource(_ context.Context, req inference.RAGIndexSourceRequest) (int, error) {
+	if f.ragIndexRequests != nil {
+		select {
+		case f.ragIndexRequests <- req:
+		default:
+		}
+	}
+	if f.ragIndexErr != nil {
+		return 0, f.ragIndexErr
+	}
+	if f.ragIndexChunkCount > 0 {
+		return f.ragIndexChunkCount, nil
+	}
+	return 1, nil
+}
+
+func (f *fakeInferenceService) DeleteRAGSource(_ context.Context, _ string, _ string, sourceID string) error {
+	if f.ragDeleteRequests != nil {
+		select {
+		case f.ragDeleteRequests <- sourceID:
+		default:
+		}
+	}
+	return f.ragDeleteErr
+}
+
+func (f *fakeInferenceService) SearchRAG(_ context.Context, req inference.RAGSearchRequest) ([]inference.RAGSearchResult, error) {
+	if f.ragSearchRequests != nil {
+		select {
+		case f.ragSearchRequests <- req:
+		default:
+		}
+	}
+	if f.ragSearchErr != nil {
+		return nil, f.ragSearchErr
+	}
+	return f.ragSearchResults, nil
+}
 
 func newAvatarModelTestRouter(t *testing.T, activeModel string) (*Router, *character.Store) {
 	t.Helper()

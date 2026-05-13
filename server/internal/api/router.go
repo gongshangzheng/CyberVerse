@@ -9,6 +9,7 @@ import (
 	"github.com/cyberverse/server/internal/config"
 	"github.com/cyberverse/server/internal/livekit"
 	"github.com/cyberverse/server/internal/orchestrator"
+	ragstore "github.com/cyberverse/server/internal/rag"
 	"github.com/cyberverse/server/internal/ws"
 )
 
@@ -20,6 +21,7 @@ type Router struct {
 	taskSvc    *agenttask.Service
 	cfg        *config.Config
 	charStore  *character.Store
+	ragStore   *ragstore.Store
 	envPath    string
 	configPath string
 	modelsDir  string
@@ -44,6 +46,7 @@ func NewRouter(
 		roomMgr:    roomMgr,
 		cfg:        cfg,
 		charStore:  charStore,
+		ragStore:   ragstore.NewStore(charStore),
 		envPath:    envPath,
 		configPath: configPath,
 		modelsDir:  filepath.Join(filepath.Dir(configPath), "models"),
@@ -69,6 +72,7 @@ func (r *Router) registerRoutes() {
 	r.mux.HandleFunc("GET /api/v1/tasks/{task_id}/artifacts/{artifact_id}", r.handleGetTaskArtifact)
 	r.mux.HandleFunc("POST /api/v1/internal/tasks/{task_id}/events", r.handleInternalTaskEvent)
 	r.mux.HandleFunc("POST /api/v1/internal/tasks/{task_id}/artifacts", r.handleInternalTaskArtifact)
+	r.mux.HandleFunc("POST /api/v1/internal/characters/{id}/knowledge/search", r.handleInternalKnowledgeSearch)
 	r.mux.HandleFunc("GET /ws/chat/{id}", r.handleWebSocket)
 
 	// Character CRUD
@@ -81,6 +85,10 @@ func (r *Router) registerRoutes() {
 	r.mux.HandleFunc("POST /api/v1/characters/{id}/avatar", r.handleUploadAvatar)
 	r.mux.HandleFunc("GET /api/v1/characters/{id}/images", r.handleListImages)
 	r.mux.HandleFunc("GET /api/v1/characters/{id}/images/{filename}", r.handleGetCharacterImage)
+	r.mux.HandleFunc("GET /api/v1/characters/{id}/knowledge", r.handleListKnowledgeSources)
+	r.mux.HandleFunc("POST /api/v1/characters/{id}/knowledge/files", r.handleUploadKnowledgeFiles)
+	r.mux.HandleFunc("DELETE /api/v1/characters/{id}/knowledge/{source_id}", r.handleDeleteKnowledgeSource)
+	r.mux.HandleFunc("POST /api/v1/characters/{id}/knowledge/{source_id}/reindex", r.handleReindexKnowledgeSource)
 	r.mux.HandleFunc("GET /api/v1/characters/{id}/idle-videos/{imgbase}/{variant}/{filename}", r.handleGetIdleVideo)
 	r.mux.HandleFunc("GET /api/v1/characters/{id}/idle-videos/{imgbase}/{filename}", r.handleGetIdleVideo)
 	r.mux.HandleFunc("DELETE /api/v1/characters/{id}/images/{filename}", r.handleDeleteImage)

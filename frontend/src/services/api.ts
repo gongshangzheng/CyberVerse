@@ -1,4 +1,4 @@
-import type { AvatarModelInfo, Character, CharacterForm, ComponentsResponse, ImageInfo, Settings, LaunchConfig, LaunchConfigUpdate, PipelineMode } from '../types'
+import type { AvatarModelInfo, Character, CharacterForm, ComponentsResponse, ImageInfo, KnowledgeSource, KnowledgeUploadSkippedFile, Settings, LaunchConfig, LaunchConfigUpdate, PipelineMode } from '../types'
 
 const API_BASE = import.meta.env.VITE_API_BASE || '/api/v1'
 
@@ -213,6 +213,60 @@ export async function deleteCharacterImage(id: string, filename: string): Promis
 export async function activateCharacterImage(id: string, filename: string): Promise<void> {
   const res = await fetch(`${API_BASE}/characters/${id}/images/${filename}/activate`, { method: 'PUT' })
   if (!res.ok) throw new Error(`Failed to activate image: ${res.status}`)
+}
+
+// ── Character Knowledge Sources ──
+
+export async function getKnowledgeSources(id: string): Promise<KnowledgeSource[]> {
+  const data = await request<{ sources: KnowledgeSource[] }>(`/characters/${id}/knowledge`)
+  return data.sources
+}
+
+export interface UploadKnowledgeFilesResult {
+  sources: KnowledgeSource[]
+  skipped?: KnowledgeUploadSkippedFile[]
+}
+
+export async function uploadKnowledgeFiles(
+  id: string,
+  files: File[],
+): Promise<UploadKnowledgeFilesResult> {
+  const formData = new FormData()
+  for (const file of files) {
+    const uploadFile = file as File & { webkitRelativePath?: string; relativePath?: string }
+    const relativePath = uploadFile.relativePath || uploadFile.webkitRelativePath || file.name
+    formData.append('files', file, relativePath)
+    formData.append('relative_paths', relativePath)
+  }
+  const res = await fetch(`${API_BASE}/characters/${id}/knowledge/files`, {
+    method: 'POST',
+    body: formData,
+  })
+  if (!res.ok) {
+    let message = `Failed to upload knowledge source: ${res.status}`
+    try {
+      const body = await res.json() as { error?: string; skipped?: KnowledgeUploadSkippedFile[] }
+      if (body.error) message = body.error
+      if (body.skipped?.length) {
+        message += ` (${body.skipped.length} skipped)`
+      }
+    } catch {
+      // keep default message
+    }
+    throw new Error(message)
+  }
+  const body = await res.json()
+  if (Array.isArray(body?.sources)) return body
+  return { sources: [body as KnowledgeSource] }
+}
+
+export async function deleteKnowledgeSource(id: string, sourceId: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/characters/${id}/knowledge/${sourceId}`, { method: 'DELETE' })
+  if (!res.ok && res.status !== 404) throw new Error(`Failed to delete knowledge source: ${res.status}`)
+}
+
+export async function reindexKnowledgeSource(id: string, sourceId: string): Promise<KnowledgeSource> {
+  return request(`/characters/${id}/knowledge/${sourceId}/reindex`, { method: 'POST' })
 }
 
 // ── Settings ──

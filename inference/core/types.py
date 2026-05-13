@@ -126,6 +126,8 @@ class VoiceLLMSessionConfig:
     """Per-session character config passed from Go through gRPC."""
     session_id: str = ""
     provider: str = ""
+    character_id: str = ""
+    character_dir: str = ""
     system_prompt: str = ""
     voice: str = ""
     bot_name: str = ""

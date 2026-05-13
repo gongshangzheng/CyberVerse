@@ -15,12 +15,14 @@ from inference.core.types import PluginConfig
 from inference.generated import (
     avatar_pb2_grpc,
     llm_pb2_grpc,
+    rag_pb2_grpc,
     tts_pb2_grpc,
     asr_pb2_grpc,
     voice_llm_pb2_grpc,
 )
 from inference.services.avatar_service import AvatarGRPCService
 from inference.services.llm_service import LLMGRPCService
+from inference.services.rag_service import RAGGRPCService
 from inference.services.tts_service import TTSGRPCService
 from inference.services.asr_service import ASRGRPCService
 from inference.services.voice_llm_service import VoiceLLMGRPCService
@@ -154,6 +156,9 @@ class InferenceServer:
         )
         llm_pb2_grpc.add_LLMServiceServicer_to_server(
             LLMGRPCService(self.registry), self.server
+        )
+        rag_pb2_grpc.add_RAGServiceServicer_to_server(
+            RAGGRPCService(self.config), self.server
         )
         tts_pb2_grpc.add_TTSServiceServicer_to_server(
             TTSGRPCService(self.registry), self.server

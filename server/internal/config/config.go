@@ -60,6 +60,7 @@ type PipelineConfig struct {
 	DefaultMode     string            `yaml:"default_mode"`
 	StreamingMode   string            `yaml:"streaming_mode"` // "direct" (default, P2P WebRTC) or "livekit"
 	VisualInput     VisualInputConfig `yaml:"visual_input,omitempty"`
+	RAG             RAGConfig         `yaml:"rag,omitempty"`
 	ICEServers      []ICEServer       `yaml:"ice_servers,omitempty"`
 	ICETCPPort      int               `yaml:"ice_tcp_port,omitempty"`      // Deprecated: use TURN instead
 	ICEPublicIP     string            `yaml:"ice_public_ip,omitempty"`     // Public IP or hostname (also used by TURN)
@@ -72,6 +73,20 @@ type PipelineConfig struct {
 	DefaultLLM      string            `yaml:"-"`
 	DefaultASR      string            `yaml:"-"`
 	DefaultTTS      string            `yaml:"-"`
+}
+
+type RAGConfig struct {
+	Enabled         *bool   `yaml:"enabled,omitempty"`
+	MaxFileBytes    int64   `yaml:"max_file_bytes,omitempty"`
+	TopK            int     `yaml:"top_k,omitempty"`
+	MinScore        float32 `yaml:"min_score,omitempty"`
+	MaxContextChars int     `yaml:"max_context_chars,omitempty"`
+	ChunkChars      int     `yaml:"chunk_chars,omitempty"`
+	ChunkOverlap    int     `yaml:"chunk_overlap_chars,omitempty"`
+}
+
+func (c RAGConfig) IsEnabled() bool {
+	return c.Enabled == nil || *c.Enabled
 }
 
 type VisualInputConfig struct {
@@ -156,6 +171,24 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.Pipeline.VisualInput.FrameTTLMS == 0 {
 		cfg.Pipeline.VisualInput.FrameTTLMS = 10000
+	}
+	if cfg.Pipeline.RAG.MaxFileBytes == 0 {
+		cfg.Pipeline.RAG.MaxFileBytes = 20 * 1024 * 1024
+	}
+	if cfg.Pipeline.RAG.TopK == 0 {
+		cfg.Pipeline.RAG.TopK = 5
+	}
+	if cfg.Pipeline.RAG.MaxContextChars == 0 {
+		cfg.Pipeline.RAG.MaxContextChars = 4500
+	}
+	if cfg.Pipeline.RAG.MinScore == 0 {
+		cfg.Pipeline.RAG.MinScore = 0.25
+	}
+	if cfg.Pipeline.RAG.ChunkChars == 0 {
+		cfg.Pipeline.RAG.ChunkChars = 900
+	}
+	if cfg.Pipeline.RAG.ChunkOverlap == 0 {
+		cfg.Pipeline.RAG.ChunkOverlap = 120
 	}
 	if len(cfg.Pipeline.ICEServers) == 0 {
 		cfg.Pipeline.ICEServers = []ICEServer{

@@ -30,6 +30,7 @@ import (
 	"github.com/cyberverse/server/internal/livekit"
 	"github.com/cyberverse/server/internal/mediapeer"
 	"github.com/cyberverse/server/internal/pb"
+	ragstore "github.com/cyberverse/server/internal/rag"
 	"github.com/cyberverse/server/internal/recording"
 	"github.com/cyberverse/server/internal/ws"
 	"github.com/pion/interceptor/pkg/cc"
@@ -664,6 +665,85 @@ func (o *Orchestrator) HealthCheck(ctx context.Context) error {
 		return errors.New("inference service is not configured")
 	}
 	return o.inference.HealthCheck(ctx)
+}
+
+func (o *Orchestrator) ragService() (inference.RAGService, bool) {
+	if o == nil || o.inference == nil {
+		return nil, false
+	}
+	svc, ok := o.inference.(inference.RAGService)
+	return svc, ok
+}
+
+func (o *Orchestrator) ragConfig() config.RAGConfig {
+	if o == nil {
+		return config.RAGConfig{}
+	}
+	cfg := o.pipelineCfg.RAG
+	if cfg.TopK == 0 {
+		cfg.TopK = 5
+	}
+	if cfg.MaxContextChars == 0 {
+		cfg.MaxContextChars = 4500
+	}
+	if cfg.MinScore == 0 {
+		cfg.MinScore = 0.25
+	}
+	return cfg
+}
+
+func (o *Orchestrator) IndexKnowledgeSource(ctx context.Context, characterID, characterDir string, source *ragstore.Source, sourcePath string) (int, error) {
+	svc, ok := o.ragService()
+	if !ok {
+		return 0, errors.New("RAG service is not configured")
+	}
+	if source == nil {
+		return 0, errors.New("knowledge source is nil")
+	}
+	return svc.IndexRAGSource(ctx, inference.RAGIndexSourceRequest{
+		CharacterID:  characterID,
+		CharacterDir: characterDir,
+		SourceID:     source.ID,
+		Title:        source.Title,
+		Filename:     source.Filename,
+		MimeType:     source.MimeType,
+		SourcePath:   sourcePath,
+	})
+}
+
+func (o *Orchestrator) DeleteKnowledgeSource(ctx context.Context, characterID, characterDir, sourceID string) error {
+	svc, ok := o.ragService()
+	if !ok {
+		return errors.New("RAG service is not configured")
+	}
+	return svc.DeleteRAGSource(ctx, characterID, characterDir, sourceID)
+}
+
+func (o *Orchestrator) searchKnowledge(ctx context.Context, characterID, query string) ([]inference.RAGSearchResult, error) {
+	cfg := o.ragConfig()
+	if !cfg.IsEnabled() || strings.TrimSpace(characterID) == "" || strings.TrimSpace(query) == "" {
+		return nil, nil
+	}
+	svc, ok := o.ragService()
+	if !ok || o.charStore == nil {
+		return nil, nil
+	}
+	charDir := o.charStore.CharDir(characterID)
+	if charDir == "" {
+		return nil, nil
+	}
+	return svc.SearchRAG(ctx, inference.RAGSearchRequest{
+		CharacterID:     characterID,
+		CharacterDir:    charDir,
+		Query:           query,
+		TopK:            cfg.TopK,
+		MaxContextChars: cfg.MaxContextChars,
+		MinScore:        cfg.MinScore,
+	})
+}
+
+func (o *Orchestrator) SearchKnowledge(ctx context.Context, characterID, query string) ([]inference.RAGSearchResult, error) {
+	return o.searchKnowledge(ctx, characterID, query)
 }
 
 func normalizedVisualInputConfig(cfg config.VisualInputConfig) config.VisualInputConfig {
@@ -1456,6 +1536,8 @@ func (o *Orchestrator) buildVoiceLLMSessionConfig(session *Session, sessionID st
 	voiceConfig := inference.VoiceLLMSessionConfig{SessionID: sessionID}
 	if session.CharacterID != "" && o.charStore != nil {
 		if char, err := o.charStore.Get(session.CharacterID); err == nil {
+			voiceConfig.CharacterID = session.CharacterID
+			voiceConfig.CharacterDir = o.charStore.CharDir(session.CharacterID)
 			voiceConfig.Provider = voiceLLMProviderOrDefault(char.VoiceProvider)
 			if o.personaAgentEnabled(session) {
 				voiceConfig.Provider = "persona"
@@ -1553,6 +1635,63 @@ func (o *Orchestrator) standardSystemPrompt(session *Session) string {
 		return composeSystemPrompt(o.globalSystemPrompt(), "")
 	}
 	return composeSystemPrompt(o.globalSystemPrompt(), characterSystemPrompt(char, true, true))
+}
+
+func appendRAGContext(rolePrompt string, ragContext string) string {
+	ragContext = strings.TrimSpace(ragContext)
+	if ragContext == "" {
+		return rolePrompt
+	}
+	rolePrompt = strings.TrimSpace(rolePrompt)
+	if rolePrompt == "" {
+		return ragContext
+	}
+	return rolePrompt + "\n\n" + ragContext
+}
+
+func formatRAGContext(results []inference.RAGSearchResult) string {
+	if len(results) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("【角色素材检索结果】\n")
+	b.WriteString("以下内容来自该角色导入的知识、文档或人物生平素材。只在与用户问题相关时使用；不要编造素材中没有的事实。\n")
+	for i, item := range results {
+		content := strings.TrimSpace(item.Content)
+		if content == "" {
+			continue
+		}
+		title := strings.TrimSpace(item.Title)
+		if title == "" {
+			title = strings.TrimSpace(item.Filename)
+		}
+		if title == "" {
+			title = "未命名素材"
+		}
+		b.WriteString(fmt.Sprintf("[%d] %s\n%s\n", i+1, title, content))
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func (o *Orchestrator) standardSystemPromptWithRAG(session *Session, ragContext string) string {
+	if session.CharacterID == "" || o.charStore == nil {
+		return composeSystemPrompt(o.globalSystemPrompt(), appendRAGContext("", ragContext))
+	}
+	char, err := o.charStore.Get(session.CharacterID)
+	if err != nil {
+		log.Printf("standardSystemPrompt: could not fetch character %s: %v", session.CharacterID, err)
+		return composeSystemPrompt(o.globalSystemPrompt(), appendRAGContext("", ragContext))
+	}
+	return composeSystemPrompt(o.globalSystemPrompt(), appendRAGContext(characterSystemPrompt(char, true, true), ragContext))
+}
+
+func latestUserText(history []ChatMessage) string {
+	for i := len(history) - 1; i >= 0; i-- {
+		if history[i].Role == "user" {
+			return strings.TrimSpace(history[i].Content)
+		}
+	}
+	return ""
 }
 
 func wrapVoiceAudioInput(ctx context.Context, audioCh <-chan []byte) <-chan inference.VoiceLLMInputEvent {
@@ -2092,7 +2231,16 @@ func (o *Orchestrator) runStandardPipeline(ctx context.Context, session *Session
 	// Prepare LLM messages
 	history := session.HistorySnapshot()
 	messages := make([]inference.ChatMessage, 0, len(history)+1)
-	if systemPrompt := o.standardSystemPrompt(session); systemPrompt != "" {
+	ragContext := ""
+	if query := latestUserText(history); query != "" {
+		results, err := o.searchKnowledge(ctx, session.CharacterID, query)
+		if err != nil {
+			log.Printf("RAG search failed for session %s character %s: %v", sessionID, session.CharacterID, err)
+		} else {
+			ragContext = formatRAGContext(results)
+		}
+	}
+	if systemPrompt := o.standardSystemPromptWithRAG(session, ragContext); systemPrompt != "" {
 		messages = append(messages, inference.ChatMessage{Role: "system", Content: systemPrompt})
 	}
 	for _, m := range history {

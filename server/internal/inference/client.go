@@ -17,6 +17,7 @@ type Client struct {
 	conn     *grpc.ClientConn
 	avatar   pb.AvatarServiceClient
 	llm      pb.LLMServiceClient
+	rag      pb.RAGServiceClient
 	tts      pb.TTSServiceClient
 	asr      pb.ASRServiceClient
 	voiceLLM pb.VoiceLLMServiceClient
@@ -49,6 +50,7 @@ func NewClient(addr string) (*Client, error) {
 		conn:     conn,
 		avatar:   pb.NewAvatarServiceClient(conn),
 		llm:      pb.NewLLMServiceClient(conn),
+		rag:      pb.NewRAGServiceClient(conn),
 		tts:      pb.NewTTSServiceClient(conn),
 		asr:      pb.NewASRServiceClient(conn),
 		voiceLLM: pb.NewVoiceLLMServiceClient(conn),
