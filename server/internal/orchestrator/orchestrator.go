@@ -282,6 +282,44 @@ func stringValue(v any) string {
 	return ""
 }
 
+func mapValue(v any) map[string]any {
+	if m, ok := v.(map[string]any); ok {
+		return m
+	}
+	return nil
+}
+
+func intValue(v any, fallback int) int {
+	switch n := v.(type) {
+	case int:
+		return n
+	case int64:
+		return int(n)
+	case float64:
+		return int(n)
+	case json.Number:
+		if parsed, err := n.Int64(); err == nil {
+			return int(parsed)
+		}
+	case string:
+		if parsed, err := strconv.Atoi(strings.TrimSpace(n)); err == nil {
+			return parsed
+		}
+	}
+	return fallback
+}
+
+func taskStatusValue(v any, fallback agenttask.Status) agenttask.Status {
+	status := agenttask.Status(stringValue(v))
+	switch status {
+	case agenttask.StatusQueued, agenttask.StatusRunning, agenttask.StatusWaitingUser,
+		agenttask.StatusCompleted, agenttask.StatusFailed, agenttask.StatusCancelled:
+		return status
+	default:
+		return fallback
+	}
+}
+
 func unixTimeFromNumber(n int64) time.Time {
 	if n <= 0 {
 		return time.Time{}
@@ -1642,6 +1680,191 @@ func (o *Orchestrator) HandleTaskEvent(task *agenttask.Task, event *agenttask.Ev
 	}
 }
 
+func taskEventBroadcastPayload(task *agenttask.Task, event *agenttask.Event) map[string]any {
+	payload := map[string]any{
+		"type":       "task_event",
+		"task_id":    task.ID,
+		"session_id": task.SessionID,
+		"seq":        event.Seq,
+		"event_type": event.EventType,
+		"status":     event.Status,
+		"message":    event.Message,
+		"progress":   event.Progress,
+		"created_at": event.CreatedAt,
+		"task":       task,
+	}
+	if strings.TrimSpace(string(event.Payload)) != "" {
+		var decoded any
+		if err := json.Unmarshal(event.Payload, &decoded); err == nil && decoded != nil {
+			payload["payload"] = decoded
+		}
+	}
+	return payload
+}
+
+func fallbackPersonaTaskEventPayload(sessionID string, payload map[string]any) map[string]any {
+	if payload == nil {
+		payload = map[string]any{}
+	}
+	payload["type"] = "task_event"
+	if stringValue(payload["session_id"]) == "" {
+		payload["session_id"] = sessionID
+	}
+	return payload
+}
+
+func sanitizePersonaArtifactPayload(payload map[string]any) map[string]any {
+	sanitized := make(map[string]any, len(payload))
+	for key, value := range payload {
+		if key == "content" {
+			continue
+		}
+		sanitized[key] = value
+	}
+	return sanitized
+}
+
+func (o *Orchestrator) persistPersonaArtifactEvent(ctx context.Context, store *agenttask.Store, taskID string, eventPayload map[string]any) map[string]any {
+	if eventPayload == nil {
+		return nil
+	}
+	sanitized := sanitizePersonaArtifactPayload(eventPayload)
+	content := stringValue(eventPayload["content"])
+	if content == "" {
+		return sanitized
+	}
+
+	artifactID := stringValue(eventPayload["artifact_id"])
+	if artifactID == "" {
+		artifactID = stringValue(eventPayload["id"])
+	}
+	if artifactID != "" {
+		if artifact, _, err := store.GetArtifact(ctx, taskID, artifactID); err == nil {
+			sanitized["artifact_id"] = artifact.ID
+			sanitized["title"] = artifact.Title
+			sanitized["type"] = artifact.Type
+			sanitized["mime_type"] = artifact.MimeType
+			return sanitized
+		} else if !errors.Is(err, agenttask.ErrNotFound) {
+			log.Printf("persona task artifact lookup failed task=%s artifact=%s: %v", taskID, artifactID, err)
+		}
+	}
+
+	artifactType := stringValue(eventPayload["type"])
+	if artifactType == "" {
+		artifactType = "html"
+	}
+	mimeType := stringValue(eventPayload["mime_type"])
+	if mimeType == "" && strings.Contains(strings.ToLower(artifactType), "html") {
+		mimeType = "text/html; charset=utf-8"
+	}
+	title := stringValue(eventPayload["title"])
+	if title == "" {
+		title = "任务产物"
+	}
+	metadata, _ := json.Marshal(mapValue(eventPayload["metadata"]))
+	artifact, err := store.CreateArtifact(ctx, taskID, agenttask.CreateArtifactInput{
+		ID:       artifactID,
+		Type:     artifactType,
+		Title:    title,
+		MimeType: mimeType,
+		Content:  content,
+		Metadata: metadata,
+	})
+	if err != nil {
+		log.Printf("persona task artifact persist failed task=%s artifact=%s: %v", taskID, artifactID, err)
+		return sanitized
+	}
+	sanitized["artifact_id"] = artifact.ID
+	sanitized["title"] = artifact.Title
+	sanitized["type"] = artifact.Type
+	sanitized["mime_type"] = artifact.MimeType
+	return sanitized
+}
+
+func (o *Orchestrator) persistPersonaTaskEvent(ctx context.Context, session *Session, sessionID string, payload map[string]any) map[string]any {
+	fallback := fallbackPersonaTaskEventPayload(sessionID, payload)
+	if o == nil || o.taskService == nil || o.taskService.Store() == nil {
+		return fallback
+	}
+
+	taskPayload := mapValue(payload["task"])
+	taskID := stringValue(payload["task_id"])
+	if taskID == "" {
+		taskID = stringValue(taskPayload["id"])
+	}
+	if taskID == "" {
+		return fallback
+	}
+
+	store := o.taskService.Store()
+	task, err := store.GetTask(ctx, taskID)
+	if errors.Is(err, agenttask.ErrNotFound) {
+		taskSessionID := stringValue(payload["session_id"])
+		if taskSessionID == "" {
+			taskSessionID = stringValue(taskPayload["session_id"])
+		}
+		if taskSessionID == "" {
+			taskSessionID = sessionID
+		}
+		characterID := stringValue(taskPayload["character_id"])
+		if characterID == "" && session != nil {
+			characterID = session.CharacterID
+		}
+		title := stringValue(taskPayload["title"])
+		userRequest := stringValue(taskPayload["user_request"])
+		if userRequest == "" {
+			userRequest = title
+		}
+		if userRequest == "" {
+			userRequest = stringValue(payload["message"])
+		}
+		if userRequest == "" {
+			userRequest = "后台任务"
+		}
+		kind := stringValue(taskPayload["kind"])
+		if kind == "" {
+			kind = "research"
+		}
+		task, err = store.CreateTask(ctx, agenttask.CreateTaskInput{
+			ID:          taskID,
+			SessionID:   taskSessionID,
+			CharacterID: characterID,
+			Kind:        kind,
+			Title:       title,
+			UserRequest: userRequest,
+		})
+	}
+	if err != nil {
+		log.Printf("persona task persist failed task=%s: %v", taskID, err)
+		return fallback
+	}
+
+	eventType := stringValue(payload["event_type"])
+	eventPayload := mapValue(payload["payload"])
+	if eventType == "artifact.created" {
+		eventPayload = o.persistPersonaArtifactEvent(ctx, store, task.ID, eventPayload)
+	}
+	var rawPayload json.RawMessage
+	if len(eventPayload) > 0 {
+		if raw, err := json.Marshal(eventPayload); err == nil {
+			rawPayload = raw
+		}
+	}
+	event, updated, err := store.AppendEvent(ctx, task.ID, agenttask.AppendEventInput{
+		EventType: eventType,
+		Status:    taskStatusValue(payload["status"], task.Status),
+		Message:   stringValue(payload["message"]),
+		Progress:  intValue(payload["progress"], intValue(taskPayload["progress"], task.Progress)),
+		Payload:   rawPayload,
+	})
+	if err != nil {
+		log.Printf("persona task event persist failed task=%s event=%s: %v", task.ID, eventType, err)
+		return fallback
+	}
+	return taskEventBroadcastPayload(updated, event)
+}
+
 // HandleTextInput processes a text message through either the standard
 // LLM→TTS→Avatar pipeline or the omni text-query path.
 func (o *Orchestrator) HandleTextInput(ctx context.Context, sessionID string, text string) error {
@@ -2639,11 +2862,7 @@ func (o *Orchestrator) runVoiceLLMPipeline(ctx context.Context, session *Session
 				if err := json.Unmarshal([]byte(rawTaskEvent), &payload); err != nil {
 					log.Printf("invalid persona task event json session=%s: %v", sessionID, err)
 				} else {
-					payload["type"] = "task_event"
-					if _, ok := payload["session_id"]; !ok {
-						payload["session_id"] = sessionID
-					}
-					o.broadcastJSON(sessionID, payload)
+					o.broadcastJSON(sessionID, o.persistPersonaTaskEvent(ctx, session, sessionID, payload))
 				}
 				if !voiceOutputHasAssistantContent(output) && !voiceOutputIsFinal(output) && strings.TrimSpace(output.GetUserTranscript()) == "" && !output.GetBargeIn() {
 					continue
