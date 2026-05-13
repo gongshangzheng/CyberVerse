@@ -283,6 +283,7 @@ export function useWebRTC() {
   const error = ref<string>('')
   const debugState = ref<AVSyncDebugState>(emptyDebugState())
   const needsPlaybackGesture = ref(false)
+  const isOutputMuted = ref(false)
 
   let room: InstanceType<typeof Room> | null = null
   const pendingVideoTracks: RemoteTrack[] = []
@@ -343,6 +344,13 @@ export function useWebRTC() {
     debugState.value.notes = next.slice(-10)
   }
 
+  function applyOutputMuted() {
+    const el = videoElement.value
+    if (!el) return
+    el.muted = isOutputMuted.value
+    el.volume = isOutputMuted.value ? 0 : 1
+  }
+
   function playbackErrorMessage(e: unknown): string {
     if (e instanceof DOMException) return `${e.name}: ${e.message}`
     if (e instanceof Error) return e.message
@@ -352,19 +360,32 @@ export function useWebRTC() {
   async function ensurePlayback(reason: string) {
     const el = videoElement.value
     if (!el || !el.srcObject) return
-    el.muted = false
+    applyOutputMuted()
     try {
       await el.play()
       needsPlaybackGesture.value = false
       pushNote(`play ok (${reason})`)
     } catch (e: unknown) {
-      needsPlaybackGesture.value = true
+      needsPlaybackGesture.value = !isOutputMuted.value
       pushNote(`play blocked (${reason}): ${playbackErrorMessage(e)}`)
     }
   }
 
   async function resumePlayback() {
+    isOutputMuted.value = false
+    applyOutputMuted()
     await ensurePlayback('user gesture')
+  }
+
+  async function toggleOutputMute() {
+    isOutputMuted.value = !isOutputMuted.value
+    applyOutputMuted()
+    pushNote(`assistant output ${isOutputMuted.value ? 'muted' : 'unmuted'}`)
+    if (isOutputMuted.value) {
+      needsPlaybackGesture.value = false
+      return
+    }
+    await ensurePlayback('assistant output unmuted')
   }
 
   function flushPendingVideoTracks() {
@@ -377,6 +398,7 @@ export function useWebRTC() {
         _videoMST = track.mediaStreamTrack
         _videoEl = el
         mergeCombinedStream()
+        applyOutputMuted()
         void ensurePlayback('queued video track')
         attachVideoFrameCallback(el)
       }
@@ -387,6 +409,7 @@ export function useWebRTC() {
     if (el) {
       _videoEl = el
       mergeCombinedStream()
+      applyOutputMuted()
       void ensurePlayback('video element ready')
     }
     flushPendingVideoTracks()
@@ -504,6 +527,7 @@ export function useWebRTC() {
     }
     error.value = ''
     needsPlaybackGesture.value = false
+    isOutputMuted.value = false
     resetState()
 
     try {
@@ -536,6 +560,7 @@ export function useWebRTC() {
           if (videoElement.value) {
             _videoEl = videoElement.value
             mergeCombinedStream()
+            applyOutputMuted()
             void ensurePlayback('video track')
             attachVideoFrameCallback(videoElement.value)
           } else {
@@ -569,6 +594,7 @@ export function useWebRTC() {
           }
 
           mergeCombinedStream()
+          applyOutputMuted()
           void ensurePlayback('audio track')
         }
       })
@@ -611,6 +637,7 @@ export function useWebRTC() {
     }
     pendingVideoTracks.length = 0
     needsPlaybackGesture.value = false
+    isOutputMuted.value = false
 
     // Clear the combined stream from the <video> element.
     if (videoElement.value) {
@@ -687,11 +714,13 @@ export function useWebRTC() {
     debugState,
     error,
     needsPlaybackGesture,
+    isOutputMuted,
     isMuted,
     micBarLevels,
     connect,
     disconnect,
     toggleMute,
     resumePlayback,
+    toggleOutputMute,
   }
 }

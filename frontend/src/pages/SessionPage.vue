@@ -58,11 +58,16 @@ const videoElement = isDirectMode ? dp.videoElement : lk.videoElement
 const connectionState = isDirectMode ? dp.connectionState : lk.connectionState
 const debugState = isDirectMode ? dp.debugState : lk.debugState
 const isMuted = isDirectMode ? dp.isMuted : lk.isMuted
-const needsPlaybackGesture = isDirectMode ? dp.needsPlaybackGesture : lk.needsPlaybackGesture
+const isOutputMuted = isDirectMode ? dp.isOutputMuted : lk.isOutputMuted
 const micBarLevels = isDirectMode ? dp.micBarLevels : lk.micBarLevels
 const toggleMute = isDirectMode ? dp.toggleMute : lk.toggleMute
-const resumePlayback = isDirectMode ? dp.resumePlayback : lk.resumePlayback
+const toggleOutputMute = isDirectMode ? dp.toggleOutputMute : lk.toggleOutputMute
 const webrtcDisconnect = isDirectMode ? dp.disconnect : lk.disconnect
+
+const outputMutedVisual = computed(() => isOutputMuted.value)
+const outputButtonTitle = computed(() => {
+  return isOutputMuted.value ? t('session.outputUnmute') : t('session.outputMute')
+})
 
 watchEffect(() => {
   const inst = videoPlayerRef.value
@@ -354,6 +359,10 @@ function toggleChatPanel() {
   isChatCollapsed.value = !isChatCollapsed.value
 }
 
+async function handleOutputButtonClick() {
+  await toggleOutputMute()
+}
+
 function formatTime(s: number): string {
   const m = Math.floor(s / 60)
   const sec = s % 60
@@ -540,18 +549,19 @@ function formatTime(s: number): string {
           </svg>
         </button>
 
-        <!-- Browser sound unlock, shown only when autoplay with audio was blocked. -->
+        <!-- Digital human output mute; also unlocks browser audio when needed. -->
         <button
-          v-if="needsPlaybackGesture"
           type="button"
-          :title="t('session.enableSound')"
-          :aria-label="t('session.enableSound')"
-          class="w-12 h-12 rounded-full bg-white/10 text-cv-text hover:bg-white/16 flex items-center justify-center transition-colors cursor-pointer"
-          @click="resumePlayback()"
+          :title="outputButtonTitle"
+          :aria-label="outputButtonTitle"
+          class="w-12 h-12 rounded-full flex items-center justify-center transition-colors cursor-pointer"
+          :class="outputMutedVisual ? 'bg-cv-danger text-white' : 'bg-white/10 text-cv-text hover:bg-white/16'"
+          @click="handleOutputButtonClick"
         >
           <svg class="w-5 h-5" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7">
             <path d="M3 8.2v3.6h3l4 3.2V5L6 8.2H3Z" stroke-linejoin="round" />
             <path d="M13 7.2a4 4 0 0 1 0 5.6M15.5 5a7.5 7.5 0 0 1 0 10" stroke-linecap="round" />
+            <path v-if="outputMutedVisual" d="M3 3l14 14" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
           </svg>
         </button>
 

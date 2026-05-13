@@ -178,6 +178,7 @@ export function useDirectWebRTC() {
   const error = ref<string>('')
   const debugState = ref<AVSyncDebugState>(emptyDebugState())
   const needsPlaybackGesture = ref(false)
+  const isOutputMuted = ref(false)
 
   let pc: RTCPeerConnection | null = null
   let sendSignaling: ((msg: any) => void) | null = null
@@ -308,7 +309,7 @@ export function useDirectWebRTC() {
     if (!remoteAudioElement) {
       remoteAudioElement = new Audio()
       remoteAudioElement.autoplay = true
-      remoteAudioElement.muted = false
+      remoteAudioElement.muted = isOutputMuted.value
       remoteAudioElement.volume = 1
       remoteAudioElement.addEventListener('play', () => {
         if (audioPlayWallMs === null) {
@@ -319,6 +320,19 @@ export function useDirectWebRTC() {
       })
     }
     return remoteAudioElement
+  }
+
+  function applyOutputMuted() {
+    const muted = isOutputMuted.value
+    const videoEl = videoElement.value
+    if (videoEl) {
+      videoEl.muted = muted
+      videoEl.volume = muted ? 0 : 1
+    }
+    if (remoteAudioElement) {
+      remoteAudioElement.muted = muted
+      remoteAudioElement.volume = muted ? 0 : 1
+    }
   }
 
   function clearRemoteAudioElement() {
@@ -335,7 +349,8 @@ export function useDirectWebRTC() {
   }
 
   async function playElement(el: HTMLMediaElement, label: string) {
-    el.muted = false
+    el.muted = isOutputMuted.value
+    el.volume = isOutputMuted.value ? 0 : 1
     try {
       await el.play()
       pushNote(`play ok (${label})`)
@@ -347,9 +362,11 @@ export function useDirectWebRTC() {
   }
 
   async function ensurePlayback(reason: string) {
+    applyOutputMuted()
     const targets: Array<{ el: HTMLMediaElement; label: string }> = []
     const videoEl = videoElement.value
-    if (videoEl?.srcObject) {
+    const hasDedicatedAudioOutput = dedicatedAudioOutput && !!remoteAudioElement?.srcObject
+    if (!hasDedicatedAudioOutput && videoEl?.srcObject) {
       targets.push({ el: videoEl, label: `video ${reason}` })
     }
     if (remoteAudioElement?.srcObject) {
@@ -358,11 +375,25 @@ export function useDirectWebRTC() {
     if (targets.length === 0) return
 
     const results = await Promise.all(targets.map((target) => playElement(target.el, target.label)))
-    needsPlaybackGesture.value = results.some((ok) => !ok)
+    needsPlaybackGesture.value = !isOutputMuted.value && results.some((ok) => !ok)
   }
 
   async function resumePlayback() {
+    isOutputMuted.value = false
+    applyOutputMuted()
     await ensurePlayback('user gesture')
+  }
+
+  async function toggleOutputMute() {
+    isOutputMuted.value = !isOutputMuted.value
+    applyOutputMuted()
+    pushNote(`assistant output ${isOutputMuted.value ? 'muted' : 'unmuted'}`)
+    if (isOutputMuted.value) {
+      needsPlaybackGesture.value = false
+      return
+    }
+    needsPlaybackGesture.value = false
+    await ensurePlayback('assistant output unmuted')
   }
 
   async function pollNetworkStats() {
@@ -429,6 +460,7 @@ export function useDirectWebRTC() {
     pendingIceServers = null
     sentWebrtcReady = false
     needsPlaybackGesture.value = false
+    isOutputMuted.value = false
     dedicatedAudioOutput = !!options.dedicatedAudioOutput
     clearRemoteAudioElement()
 
@@ -479,11 +511,13 @@ export function useDirectWebRTC() {
       if (videoMST) tracks.push(videoMST)
       if (audioMST && !dedicatedAudioOutput) tracks.push(audioMST)
       el.srcObject = new MediaStream(tracks)
-      el.muted = false
+      el.muted = isOutputMuted.value
+      el.volume = isOutputMuted.value ? 0 : 1
       console.log(`[DirectRTC][${ts()}] merged stream set: video=${!!videoMST} audio=${!!audioMST}`)
       if (audioMST && dedicatedAudioOutput) {
         const audioEl = remoteAudioEl()
         audioEl.srcObject = new MediaStream([audioMST])
+        applyOutputMuted()
       }
       // srcObject may be replaced when audio arrives after video, so autoplay is not enough.
       void ensurePlayback(reason)
@@ -678,6 +712,7 @@ export function useDirectWebRTC() {
     }
     sentWebrtcReady = false
     needsPlaybackGesture.value = false
+    isOutputMuted.value = false
 
     if (videoElement.value) {
       videoElement.value.srcObject = null
@@ -758,12 +793,14 @@ export function useDirectWebRTC() {
     debugState,
     error,
     needsPlaybackGesture,
+    isOutputMuted,
     isMuted,
     micBarLevels,
     connect,
     disconnect,
     toggleMute,
     resumePlayback,
+    toggleOutputMute,
     handleSignaling,
   }
 }
