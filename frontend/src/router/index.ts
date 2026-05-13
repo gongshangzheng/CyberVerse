@@ -16,6 +16,11 @@ const router = createRouter({
       component: () => import('../pages/LandingPage.vue'),
     },
     {
+      path: '/kanshan',
+      name: 'kanshan-landing',
+      component: () => import('../pages/KanshanLandingPage.vue'),
+    },
+    {
       path: '/characters',
       name: 'characters',
       component: () => import('../pages/CharacterListPage.vue'),
