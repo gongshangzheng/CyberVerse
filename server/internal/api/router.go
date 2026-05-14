@@ -25,6 +25,7 @@ type Router struct {
 	envPath    string
 	configPath string
 	modelsDir  string
+	zhihuAuth  *zhihuAuthService
 	mux        *http.ServeMux
 }
 
@@ -50,6 +51,7 @@ func NewRouter(
 		envPath:    envPath,
 		configPath: configPath,
 		modelsDir:  filepath.Join(filepath.Dir(configPath), "models"),
+		zhihuAuth:  newZhihuAuthService(),
 		mux:        http.NewServeMux(),
 	}
 	if len(taskServices) > 0 {
@@ -62,6 +64,10 @@ func NewRouter(
 func (r *Router) registerRoutes() {
 	r.mux.HandleFunc("GET /api/v1/health", r.handleHealth)
 	r.mux.HandleFunc("GET /api/v1/components", r.handleListComponents)
+	r.mux.HandleFunc("GET /api/v1/auth/zhihu/url", r.handleZhihuAuthURL)
+	r.mux.HandleFunc("POST /api/v1/auth/zhihu/callback", r.handleZhihuAuthCallback)
+	r.mux.HandleFunc("GET /api/v1/auth/zhihu/me", r.handleZhihuMe)
+	r.mux.HandleFunc("POST /api/v1/auth/zhihu/logout", r.handleZhihuLogout)
 	r.mux.HandleFunc("POST /api/v1/sessions", r.handleCreateSession)
 	r.mux.HandleFunc("DELETE /api/v1/sessions/{id}", r.handleDeleteSession)
 	r.mux.HandleFunc("POST /api/v1/sessions/{id}/message", r.handleSendMessage)
