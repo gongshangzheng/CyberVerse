@@ -116,9 +116,9 @@ func main() {
 	// WebRTC API with interceptors (NACK, TWCC, GCC pacer) for direct streaming mode
 	if cfg.Pipeline.StreamingMode == "direct" {
 		api, estimatorCh, err := direct.NewWebRTCAPI(direct.WebRTCAPIConfig{
-			InitialBitrate: 6_000_000,  // 6 Mbps — comfortably above VP8 actual ~4 Mbps to avoid pacer starvation at turn start
-			MinBitrate:     5_000_000,  // 5 Mbps — floor above VP8 actual ~4 Mbps to prevent AV desync from pacer queuing
-			MaxBitrate:     10_000_000, // 10 Mbps
+			InitialBitrate: 2_500_000,
+			MinBitrate:     800_000,
+			MaxBitrate:     4_000_000,
 		})
 		if err != nil {
 			log.Fatalf("WebRTC API setup failed: %v", err)

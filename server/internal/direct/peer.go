@@ -594,27 +594,26 @@ func (p *DirectPeer) publishAVSegment(seg *mediapeer.AVSegment) {
 	nAudio := len(opusFrames)
 
 	// --- RTP timestamp gap correction ---
-	// Between segments, WriteSample is not called so pion's internal RTP
-	// timestamp counter freezes. When the next segment arrives, the first
-	// frame's timestamp is only frameDur ahead of the last frame, but the
-	// actual wall-clock gap is seconds. The browser's jitter buffer sees
-	// this as "frame arrived seconds late" and grows indefinitely.
-	//
-	// Fix: set the first sample's Duration to the actual wall-clock gap.
-	// pion advances the RTP timestamp by Duration * clockRate before
-	// writing the packet, so the timestamp jumps to match arrival time.
+	// Between segments WriteSample pauses; without a Duration bump the browser
+	// jitter buffer treats the next frame as very late. Use the same capped gap
+	// on both tracks so audio RTP cannot run ahead of video (asymmetric
+	// thresholds previously caused progressive desync on long utterances).
 	now := time.Now()
-	if !p.lastVideoWriteTime.IsZero() && len(seg.VP8Samples) > 0 {
-		videoGap := now.Sub(p.lastVideoWriteTime)
-		if videoGap > 2*frameDur {
-			seg.VP8Samples[0].Duration = videoGap
-			log.Printf("[DirectPeer] session=%s RTP timestamp gap correction: video=%v", p.sessionID, videoGap)
-		}
-	}
-	if !p.lastAudioWriteTime.IsZero() && len(opusFrames) > 0 {
-		audioGap := now.Sub(p.lastAudioWriteTime)
-		if audioGap > 40*time.Millisecond {
-			opusFrames[0].Duration = audioGap
+	if !p.lastVideoWriteTime.IsZero() {
+		wallGap := now.Sub(p.lastVideoWriteTime)
+		if wallGap > rtpGapThreshold(frameDur) {
+			applied := cappedRTPGap(wallGap)
+			if len(seg.VP8Samples) > 0 {
+				seg.VP8Samples[0].Duration = applied
+			}
+			if len(opusFrames) > 0 {
+				opusFrames[0].Duration = applied
+			}
+			if applied != wallGap {
+				log.Printf("[DirectPeer] session=%s RTP timestamp gap correction: wall=%v applied=%v", p.sessionID, wallGap, applied)
+			} else {
+				log.Printf("[DirectPeer] session=%s RTP timestamp gap correction: %v", p.sessionID, applied)
+			}
 		}
 	}
 

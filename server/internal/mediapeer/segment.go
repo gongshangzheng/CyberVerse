@@ -146,7 +146,16 @@ func EncodePCMToOpusSamples(pcm []byte, sampleRate int) ([]media.Sample, error) 
 	// 20ms frame parameters
 	samplesPerFrame := sampleRate / 50   // 20ms = 1/50 second
 	bytesPerFrame := samplesPerFrame * 2 // 16-bit mono
-	opusBuf := make([]byte, 4000)        // max opus frame size
+	if bytesPerFrame <= 0 {
+		return nil, fmt.Errorf("invalid opus frame size for sample_rate=%d", sampleRate)
+	}
+	opusBuf := make([]byte, 4000) // max opus frame size
+
+	// Pad trailing bytes (often silence from strict segment sizing) so RTP audio
+	// duration matches the PCM buffer length and lip-synced video segments.
+	if rem := len(pcm) % bytesPerFrame; rem != 0 {
+		pcm = append(append([]byte(nil), pcm...), make([]byte, bytesPerFrame-rem)...)
+	}
 
 	estimatedFrames := len(pcm) / bytesPerFrame
 	samples := make([]media.Sample, 0, estimatedFrames)

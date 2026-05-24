@@ -35,12 +35,15 @@ func NewWebRTCAPI(cfg WebRTCAPIConfig) (*webrtc.API, <-chan cc.BandwidthEstimato
 
 	i := &interceptor.Registry{}
 
-	// 1) GCC congestion control + Leaky Bucket Pacer (must be before RegisterDefaultInterceptors)
+	// 1) GCC + NoOp pacer (must be before RegisterDefaultInterceptors).
+	// Real-time pacing lives in DirectPeer.publishAVSegment; leaky-bucket pacing
+	// plus GCC dropping to MinBitrate during segment idle mis-queues RTP.
 	congestionController, err := cc.NewInterceptor(func() (cc.BandwidthEstimator, error) {
 		return gcc.NewSendSideBWE(
 			gcc.SendSideBWEInitialBitrate(cfg.InitialBitrate),
 			gcc.SendSideBWEMinBitrate(cfg.MinBitrate),
 			gcc.SendSideBWEMaxBitrate(cfg.MaxBitrate),
+			gcc.SendSideBWEPacer(gcc.NewNoOpPacer()),
 		)
 	})
 	if err != nil {
