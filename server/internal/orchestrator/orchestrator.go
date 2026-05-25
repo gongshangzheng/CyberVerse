@@ -451,19 +451,31 @@ func buildDoubaoDialogContext(messages []map[string]any, maxPairs int, now time.
 	}
 
 	items := make([]DialogContextItem, len(paired))
-	fallbackStart := now.Add(-time.Duration(len(paired)) * time.Millisecond)
 	for i, msg := range paired {
-		ts := msg.timestamp
-		if ts.IsZero() || ts.After(now) {
-			ts = fallbackStart.Add(time.Duration(i) * time.Millisecond)
-		}
 		items[i] = DialogContextItem{
 			Role:      msg.role,
 			Text:      msg.text,
-			Timestamp: ts.UnixMilli(),
+			Timestamp: msg.timestamp.UnixMilli(),
 		}
 	}
+	return normalizeDialogContextTimestamps(items, now)
+}
 
+func normalizeDialogContextTimestamps(items []DialogContextItem, now time.Time) []DialogContextItem {
+	if len(items) == 0 {
+		return nil
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	fallbackStart := now.Add(-time.Duration(len(items)) * time.Millisecond)
+	for i := range items {
+		if items[i].Timestamp <= 0 || time.UnixMilli(items[i].Timestamp).After(now) {
+			items[i].Timestamp = fallbackStart.Add(time.Duration(i) * time.Millisecond).UnixMilli()
+		}
+	}
 	var last int64
 	for i := range items {
 		if items[i].Timestamp <= last {
@@ -478,6 +490,43 @@ func buildDoubaoDialogContext(messages []map[string]any, maxPairs int, now time.
 		}
 	}
 	return items
+}
+
+func buildVoiceDialogContextFromSession(session *Session, excludeTurnSeq uint64, maxPairs int, now time.Time) []DialogContextItem {
+	if session == nil {
+		return nil
+	}
+	if maxPairs <= 0 {
+		maxPairs = doubaoDialogContextMaxPairs
+	}
+	items := session.DialogContextSnapshot()
+	for _, msg := range session.HistorySnapshot() {
+		if excludeTurnSeq > 0 && msg.TurnSeq == excludeTurnSeq {
+			continue
+		}
+		role := strings.ToLower(strings.TrimSpace(msg.Role))
+		if role != "user" && role != "assistant" {
+			continue
+		}
+		text := strings.TrimSpace(msg.Content)
+		if text == "" {
+			continue
+		}
+		timestamp := int64(0)
+		if !msg.Timestamp.IsZero() {
+			timestamp = msg.Timestamp.UTC().UnixMilli()
+		}
+		items = append(items, DialogContextItem{
+			Role:      role,
+			Text:      text,
+			Timestamp: timestamp,
+		})
+	}
+	maxItems := maxPairs * 2
+	if len(items) > maxItems {
+		items = items[len(items)-maxItems:]
+	}
+	return normalizeDialogContextTimestamps(items, now)
 }
 
 func startupGreetingHistory(items []DialogContextItem, maxItems int) []DialogContextItem {
@@ -1579,6 +1628,10 @@ func (o *Orchestrator) buildVoiceStartupGreetingPrompt(session *Session) string 
 }
 
 func (o *Orchestrator) buildVoiceLLMSessionConfig(session *Session, sessionID string) inference.VoiceLLMSessionConfig {
+	return o.buildVoiceLLMSessionConfigExcludingTurn(session, sessionID, 0)
+}
+
+func (o *Orchestrator) buildVoiceLLMSessionConfigExcludingTurn(session *Session, sessionID string, excludeTurnSeq uint64) inference.VoiceLLMSessionConfig {
 	voiceConfig := inference.VoiceLLMSessionConfig{SessionID: sessionID}
 	if session.CharacterID != "" && o.charStore != nil {
 		if char, err := o.charStore.Get(session.CharacterID); err == nil {
@@ -1599,7 +1652,7 @@ func (o *Orchestrator) buildVoiceLLMSessionConfig(session *Session, sessionID st
 	if o.personaAgentEnabled(session) {
 		voiceConfig.Provider = "persona"
 	}
-	for _, item := range session.DialogContextSnapshot() {
+	for _, item := range buildVoiceDialogContextFromSession(session, excludeTurnSeq, doubaoDialogContextMaxPairs, time.Now().UTC()) {
 		voiceConfig.DialogContext = append(voiceConfig.DialogContext, inference.VoiceLLMDialogContextItem{
 			Role:      item.Role,
 			Text:      item.Text,
@@ -2740,7 +2793,7 @@ func (o *Orchestrator) runVoiceLLMPipeline(ctx context.Context, session *Session
 		inputCh,
 		pipelineSeq,
 		initialTurnSeq,
-		o.buildVoiceLLMSessionConfig(session, sessionID),
+		o.buildVoiceLLMSessionConfigExcludingTurn(session, sessionID, initialTurnSeq),
 		false,
 	)
 }
