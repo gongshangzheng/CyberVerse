@@ -2,8 +2,14 @@ import { ref, watch } from 'vue'
 import type {
   ConnectionState,
   AVSyncDebugState,
+  AVSegmentTimeline,
   FrameJitterStats,
   WebRTCNetworkStats,
+} from './useWebRTC'
+import {
+  createAVPlayoutEstimatorState,
+  estimateAVPlayoutFromStats,
+  formatJitterBufferDelta,
 } from './useWebRTC'
 
 // ─── Diagnostics ──────────────────────────────────────────────────────────
@@ -17,13 +23,42 @@ let videoFrameCount = 0
 let videoFirstFrameTime: number | null = null
 let videoLastFrameWallMs: number | null = null
 let audioPlayWallMs: number | null = null
-let rvfcCheckpointMedia: number | null = null
-let rvfcCheckpointCurrentTime: number | null = null
 let debugPollTimer: ReturnType<typeof setInterval> | null = null
 
 // Jitter measurement
 const JITTER_WINDOW = 120
 let frameArrivalTimes: number[] = []
+const AV_SEGMENT_TIMELINE_LIMIT = 80
+const AV_SEGMENT_MATCH_TOLERANCE_MS = 80
+const AV_MARKER_MATCH_TOLERANCE_MS = 120
+let avSegmentTimelines: AVSegmentTimeline[] = []
+let avSegmentMediaBaseTurnSeq: number | null = null
+let avSegmentMediaBaseMs: number | null = null
+let avSegmentPresentationLoggingEnabled = false
+let lastPresentedSegmentKey = ''
+let avCalibrationEnabled = false
+let avCalibrationCanvas: HTMLCanvasElement | null = null
+let avCalibrationCtx: CanvasRenderingContext2D | null = null
+let avCalibrationVideoHot = false
+let avCalibrationAudioContext: AudioContext | null = null
+let avCalibrationAudioSource: MediaStreamAudioSourceNode | null = null
+let avCalibrationWorklet: AudioWorkletNode | null = null
+let avCalibrationSilentGain: GainNode | null = null
+let pendingAVCalibrationAudioOutputTimes: number[] = []
+let pendingAVCalibrationVideoEvents: Array<{ mediaInTurnMs: number; compositorTimeMs: number }> = []
+
+type AVCalibrationMarker = {
+  id: number
+  turnSeq: number
+  mediaTimeMs: number
+  frequencyHz: number
+  durationMs: number
+  videoCompositorTimeMs: number | null
+  audioOutputTimeMs: number | null
+  logged: boolean
+}
+
+const avCalibrationMarkers = new Map<number, AVCalibrationMarker>()
 
 function resetJitterState() {
   frameArrivalTimes = []
@@ -33,6 +68,355 @@ function recordFrameArrival(wallMs: number) {
   frameArrivalTimes.push(wallMs)
   if (frameArrivalTimes.length > JITTER_WINDOW) {
     frameArrivalTimes.shift()
+  }
+}
+
+function resetAVSegmentDiagnostics() {
+  avSegmentTimelines = []
+  avSegmentMediaBaseTurnSeq = null
+  avSegmentMediaBaseMs = null
+  lastPresentedSegmentKey = ''
+  avCalibrationVideoHot = false
+  pendingAVCalibrationAudioOutputTimes = []
+  pendingAVCalibrationVideoEvents = []
+  avCalibrationMarkers.clear()
+}
+
+function segmentKey(seg: AVSegmentTimeline): string {
+  return `${seg.turnSeq}:${seg.segmentSeq}`
+}
+
+function numberField(data: any, key: string): number {
+  const value = Number(data?.[key])
+  return Number.isFinite(value) ? value : 0
+}
+
+function parseAVSegmentTimeline(data: any): AVSegmentTimeline | null {
+  const turnSeq = numberField(data, 'turn_seq')
+  const segmentSeq = numberField(data, 'segment_seq')
+  if (turnSeq <= 0 || segmentSeq <= 0) {
+    return null
+  }
+  return {
+    turnSeq,
+    segmentSeq,
+    mediaStartMs: numberField(data, 'media_start_ms'),
+    durationMs: numberField(data, 'duration_ms'),
+    videoFrames: numberField(data, 'video_frames'),
+    fps: numberField(data, 'fps'),
+    audioSamples: numberField(data, 'audio_samples'),
+    sampleRate: numberField(data, 'sample_rate'),
+    publishWallMs: numberField(data, 'publish_wall_ms'),
+    receivedWallMs: Date.now(),
+    markerId: numberField(data, 'marker_id'),
+    markerMediaTimeMs: numberField(data, 'marker_media_time_ms'),
+    markerDurationMs: numberField(data, 'marker_duration_ms'),
+    markerFrequencyHz: numberField(data, 'marker_frequency_hz'),
+  }
+}
+
+function appendAVSegmentTimeline(seg: AVSegmentTimeline) {
+  avSegmentTimelines = avSegmentTimelines
+    .filter(existing => segmentKey(existing) !== segmentKey(seg))
+    .concat(seg)
+    .sort((a, b) => a.turnSeq === b.turnSeq ? a.segmentSeq - b.segmentSeq : a.turnSeq - b.turnSeq)
+    .slice(-AV_SEGMENT_TIMELINE_LIMIT)
+  if (seg.markerId > 0 && seg.markerMediaTimeMs > 0) {
+    avCalibrationMarkers.set(seg.markerId, {
+      id: seg.markerId,
+      turnSeq: seg.turnSeq,
+      mediaTimeMs: seg.markerMediaTimeMs,
+      frequencyHz: seg.markerFrequencyHz,
+      durationMs: seg.markerDurationMs,
+      videoCompositorTimeMs: null,
+      audioOutputTimeMs: null,
+      logged: false,
+    })
+    attachPendingAVCalibrationVideoEvents()
+    attachPendingAVCalibrationAudioMarkers()
+    pruneAVCalibrationMarkers()
+  }
+}
+
+function latestTurnSegments(): AVSegmentTimeline[] {
+  const latest = avSegmentTimelines[avSegmentTimelines.length - 1]
+  if (!latest) return []
+  return avSegmentTimelines.filter(seg => seg.turnSeq === latest.turnSeq)
+}
+
+function pruneAVCalibrationMarkers() {
+  const markers = [...avCalibrationMarkers.values()].sort((a, b) => a.mediaTimeMs - b.mediaTimeMs)
+  for (const marker of markers.slice(0, Math.max(0, markers.length - 40))) {
+    avCalibrationMarkers.delete(marker.id)
+  }
+}
+
+function maybeLogAVCalibrationMarker(marker: AVCalibrationMarker) {
+  if (marker.logged || marker.videoCompositorTimeMs === null || marker.audioOutputTimeMs === null) return
+  marker.logged = true
+  const perceivedAVOffsetMs = marker.videoCompositorTimeMs - marker.audioOutputTimeMs
+  console.log(
+    `[DirectRTC][${ts()}] AV calibration marker=${marker.id}` +
+      ` perceivedAVOffsetMs=${perceivedAVOffsetMs.toFixed(1)}` +
+      ` videoCompositor=${marker.videoCompositorTimeMs.toFixed(1)}ms` +
+      ` audioOutput=${marker.audioOutputTimeMs.toFixed(1)}ms` +
+      ` markerMedia=${marker.mediaTimeMs}ms freq=${marker.frequencyHz}Hz`
+  )
+}
+
+function findCalibrationMarkerByMediaTime(mediaInTurnMs: number): AVCalibrationMarker | null {
+  let best: AVCalibrationMarker | null = null
+  let bestDistance = Number.POSITIVE_INFINITY
+  for (const marker of avCalibrationMarkers.values()) {
+    if (marker.videoCompositorTimeMs !== null) continue
+    const distance = Math.abs(marker.mediaTimeMs - mediaInTurnMs)
+    if (distance < bestDistance) {
+      best = marker
+      bestDistance = distance
+    }
+  }
+  return best && bestDistance <= AV_MARKER_MATCH_TOLERANCE_MS ? best : null
+}
+
+function nextCalibrationMarkerForAudio(): AVCalibrationMarker | null {
+  return [...avCalibrationMarkers.values()]
+    .filter(marker => marker.audioOutputTimeMs === null)
+    .sort((a, b) => a.mediaTimeMs - b.mediaTimeMs)[0] ?? null
+}
+
+function attachPendingAVCalibrationVideoEvents() {
+  const remaining: Array<{ mediaInTurnMs: number; compositorTimeMs: number }> = []
+  for (const event of pendingAVCalibrationVideoEvents) {
+    const marker = findCalibrationMarkerByMediaTime(event.mediaInTurnMs)
+    if (!marker) {
+      remaining.push(event)
+      continue
+    }
+    marker.videoCompositorTimeMs = event.compositorTimeMs
+    maybeLogAVCalibrationMarker(marker)
+  }
+  pendingAVCalibrationVideoEvents = remaining.slice(-10)
+}
+
+function attachPendingAVCalibrationAudioMarkers() {
+  while (pendingAVCalibrationAudioOutputTimes.length > 0) {
+    const marker = nextCalibrationMarkerForAudio()
+    if (!marker) return
+    marker.audioOutputTimeMs = pendingAVCalibrationAudioOutputTimes.shift() ?? null
+    maybeLogAVCalibrationMarker(marker)
+  }
+}
+
+function detectCalibrationFlash(el: HTMLVideoElement): boolean {
+  if (!avCalibrationEnabled || el.videoWidth <= 0 || el.videoHeight <= 0) return false
+  if (!avCalibrationCanvas) {
+    avCalibrationCanvas = document.createElement('canvas')
+    avCalibrationCanvas.width = 24
+    avCalibrationCanvas.height = 24
+    avCalibrationCtx = avCalibrationCanvas.getContext('2d', { willReadFrequently: true })
+  }
+  const ctx = avCalibrationCtx
+  if (!ctx) return false
+
+  const sourceW = Math.min(el.videoWidth, Math.max(48, Math.floor(el.videoWidth / 5)))
+  const sourceH = Math.min(el.videoHeight, Math.max(48, Math.floor(el.videoHeight / 5)))
+  try {
+    ctx.drawImage(el, 0, 0, sourceW, sourceH, 0, 0, avCalibrationCanvas.width, avCalibrationCanvas.height)
+    const pixels = ctx.getImageData(0, 0, avCalibrationCanvas.width, avCalibrationCanvas.height).data
+    let hot = 0
+    const total = pixels.length / 4
+    for (let i = 0; i < pixels.length; i += 4) {
+      if (pixels[i] > 180 && pixels[i + 1] < 100 && pixels[i + 2] > 180) {
+        hot++
+      }
+    }
+    return hot / total > 0.35
+  } catch {
+    return false
+  }
+}
+
+function recordAVCalibrationVideoFrame(
+  el: HTMLVideoElement,
+  rvfcNowMs: DOMHighResTimeStamp,
+  meta: VideoFrameMeta,
+  mediaInTurnMs: number,
+) {
+  if (!avCalibrationEnabled) return
+  const hot = detectCalibrationFlash(el)
+  if (!hot) {
+    avCalibrationVideoHot = false
+    return
+  }
+  if (avCalibrationVideoHot) return
+  avCalibrationVideoHot = true
+
+  const marker = findCalibrationMarkerByMediaTime(mediaInTurnMs)
+  const compositorTimeMs = Number.isFinite(meta.expectedDisplayTime ?? NaN)
+    ? Number(meta.expectedDisplayTime)
+    : rvfcNowMs
+  if (!marker) {
+    pendingAVCalibrationVideoEvents.push({ mediaInTurnMs, compositorTimeMs })
+    pendingAVCalibrationVideoEvents = pendingAVCalibrationVideoEvents.slice(-10)
+    return
+  }
+  marker.videoCompositorTimeMs = compositorTimeMs
+  maybeLogAVCalibrationMarker(marker)
+}
+
+function recordAVSegmentPresentation(
+  el: HTMLVideoElement,
+  rvfcNowMs: DOMHighResTimeStamp,
+  mediaTimeSeconds: number,
+  presentedFrames: number,
+  expectedDisplayTime?: DOMHighResTimeStamp,
+) {
+  if (!avSegmentPresentationLoggingEnabled && !avCalibrationEnabled) return
+  const segments = latestTurnSegments()
+  if (segments.length === 0) return
+
+  const turnSeq = segments[0].turnSeq
+  const mediaTimeMs = mediaTimeSeconds * 1000
+  if (avSegmentMediaBaseTurnSeq !== turnSeq || avSegmentMediaBaseMs === null) {
+    avSegmentMediaBaseTurnSeq = turnSeq
+    avSegmentMediaBaseMs = mediaTimeMs - segments[0].mediaStartMs
+    lastPresentedSegmentKey = ''
+  }
+
+  const mediaInTurnMs = mediaTimeMs - avSegmentMediaBaseMs
+  recordAVCalibrationVideoFrame(el, rvfcNowMs, { mediaTime: mediaTimeSeconds, presentedFrames, expectedDisplayTime }, mediaInTurnMs)
+  if (!avSegmentPresentationLoggingEnabled) return
+
+  const seg = segments.find(item =>
+    mediaInTurnMs >= item.mediaStartMs - AV_SEGMENT_MATCH_TOLERANCE_MS &&
+    mediaInTurnMs < item.mediaStartMs + item.durationMs + AV_SEGMENT_MATCH_TOLERANCE_MS
+  )
+  if (!seg) return
+
+  const key = segmentKey(seg)
+  if (key === lastPresentedSegmentKey) return
+  lastPresentedSegmentKey = key
+  console.log(
+    `[DirectRTC][${ts()}] AV segment presented turn=${seg.turnSeq} segment=${seg.segmentSeq}` +
+      ` mediaInTurn=${Math.round(mediaInTurnMs)}ms expected=${seg.mediaStartMs}-${seg.mediaStartMs + seg.durationMs}ms` +
+      ` rvfcMedia=${mediaTimeSeconds.toFixed(3)}s presentedFrames=${presentedFrames}`
+  )
+}
+
+const avCalibrationWorkletSource = `
+class AVMarkerDetector extends AudioWorkletProcessor {
+  constructor() {
+    super()
+    this.previousHot = false
+    this.lastPostFrame = -Infinity
+  }
+
+  process(inputs) {
+    const channel = inputs[0] && inputs[0][0]
+    if (!channel || channel.length === 0) return true
+
+    let energy = 0
+    let sin = 0
+    let cos = 0
+    const freq = 1800
+    const step = 2 * Math.PI * freq / sampleRate
+    for (let i = 0; i < channel.length; i++) {
+      const sample = channel[i]
+      energy += sample * sample
+      const angle = (currentFrame + i) * step
+      sin += sample * Math.sin(angle)
+      cos += sample * Math.cos(angle)
+    }
+
+    const rms = Math.sqrt(energy / channel.length)
+    const tone = Math.sqrt(sin * sin + cos * cos) / channel.length
+    const hot = rms > 0.10 && tone > 0.055 && tone / Math.max(rms, 0.0001) > 0.35
+    if (hot && !this.previousHot && currentFrame - this.lastPostFrame > sampleRate * 0.3) {
+      this.lastPostFrame = currentFrame
+      this.port.postMessage({ contextTime: currentTime })
+    }
+    this.previousHot = hot
+    return true
+  }
+}
+
+registerProcessor('av-marker-detector', AVMarkerDetector)
+`
+
+function recordAVCalibrationAudioMarker(contextTime: number) {
+  const ctx = avCalibrationAudioContext
+  const timestamp = ctx && typeof ctx.getOutputTimestamp === 'function'
+    ? ctx.getOutputTimestamp()
+    : null
+  const performanceTime = Number(timestamp?.performanceTime)
+  const outputContextTime = Number(timestamp?.contextTime)
+  const audioOutputTimeMs = Number.isFinite(performanceTime) && Number.isFinite(outputContextTime)
+    ? performanceTime + (contextTime - outputContextTime) * 1000
+    : performance.now()
+
+  const marker = nextCalibrationMarkerForAudio()
+  if (!marker) {
+    pendingAVCalibrationAudioOutputTimes.push(audioOutputTimeMs)
+    pendingAVCalibrationAudioOutputTimes = pendingAVCalibrationAudioOutputTimes.slice(-10)
+    return
+  }
+  marker.audioOutputTimeMs = audioOutputTimeMs
+  maybeLogAVCalibrationMarker(marker)
+}
+
+function stopAVCalibrationAudioMonitor() {
+  avCalibrationAudioSource?.disconnect()
+  avCalibrationWorklet?.disconnect()
+  avCalibrationSilentGain?.disconnect()
+  avCalibrationAudioSource = null
+  avCalibrationWorklet = null
+  avCalibrationSilentGain = null
+  if (avCalibrationAudioContext && avCalibrationAudioContext.state !== 'closed') {
+    void avCalibrationAudioContext.close()
+  }
+  avCalibrationAudioContext = null
+}
+
+async function startAVCalibrationAudioMonitor(track: MediaStreamTrack) {
+  if (!avCalibrationEnabled || avCalibrationWorklet) return
+  const AudioContextCtor = window.AudioContext || (window as any).webkitAudioContext
+  if (!AudioContextCtor) return
+
+  try {
+    const ctx = new AudioContextCtor() as AudioContext
+    if (!ctx.audioWorklet || typeof AudioWorkletNode === 'undefined') {
+      void ctx.close()
+      return
+    }
+    const blob = new Blob([avCalibrationWorkletSource], { type: 'text/javascript' })
+    const url = URL.createObjectURL(blob)
+    try {
+      await ctx.audioWorklet.addModule(url)
+    } finally {
+      URL.revokeObjectURL(url)
+    }
+
+    const source = ctx.createMediaStreamSource(new MediaStream([track]))
+    const worklet = new AudioWorkletNode(ctx, 'av-marker-detector')
+    const gain = ctx.createGain()
+    gain.gain.value = 0
+    worklet.port.onmessage = (event) => {
+      const contextTime = Number(event.data?.contextTime)
+      if (Number.isFinite(contextTime)) {
+        recordAVCalibrationAudioMarker(contextTime)
+      }
+    }
+    source.connect(worklet)
+    worklet.connect(gain)
+    gain.connect(ctx.destination)
+    avCalibrationAudioContext = ctx
+    avCalibrationAudioSource = source
+    avCalibrationWorklet = worklet
+    avCalibrationSilentGain = gain
+    console.log(`[DirectRTC][${ts()}] AV calibration audio monitor enabled`)
+  } catch (err) {
+    stopAVCalibrationAudioMonitor()
+    console.warn('[DirectRTC] AV calibration audio monitor failed:', err)
   }
 }
 
@@ -102,6 +486,8 @@ const emptyDebugState = (): AVSyncDebugState => ({
   notes: [],
   jitter: { meanIntervalMs: 0, stddevMs: 0, maxIntervalMs: 0, p95IntervalMs: 0, stutterCount: 0, windowSize: 0 },
   network: null,
+  avSync: null,
+  segmentTimeline: null,
 })
 
 function resetState() {
@@ -109,20 +495,15 @@ function resetState() {
   videoFirstFrameTime = null
   videoLastFrameWallMs = null
   audioPlayWallMs = null
-  rvfcCheckpointMedia = null
-  rvfcCheckpointCurrentTime = null
   resetJitterState()
 }
 
-type VideoFrameMeta = { mediaTime: number; presentedFrames: number }
+type VideoFrameMeta = { mediaTime: number; presentedFrames: number; expectedDisplayTime?: DOMHighResTimeStamp }
 type VideoWithRVFC = HTMLVideoElement & {
   requestVideoFrameCallback: (cb: (now: DOMHighResTimeStamp, meta: VideoFrameMeta) => void) => void
 }
 
 function attachVideoFrameCallback(el: HTMLVideoElement) {
-  rvfcCheckpointMedia = null
-  rvfcCheckpointCurrentTime = null
-
   if (!('requestVideoFrameCallback' in el)) {
     (el as HTMLVideoElement).addEventListener('timeupdate', () => {
       if ((el as HTMLVideoElement).currentTime > 0) {
@@ -140,6 +521,7 @@ function attachVideoFrameCallback(el: HTMLVideoElement) {
     videoFrameCount++
     videoLastFrameWallMs = Date.now()
     recordFrameArrival(now)
+    recordAVSegmentPresentation(el, now, meta.mediaTime, meta.presentedFrames, meta.expectedDisplayTime)
 
     if (videoFirstFrameTime === null) {
       videoFirstFrameTime = now
@@ -147,22 +529,6 @@ function attachVideoFrameCallback(el: HTMLVideoElement) {
         `[DirectRTC][${ts()}] VIDEO first frame: mediaTime=${meta.mediaTime.toFixed(3)}s` +
           ` presentedFrames=${meta.presentedFrames}`
       )
-    }
-
-    if (videoFrameCount > 0 && videoFrameCount % 50 === 0) {
-      const ct = el.currentTime
-      if (rvfcCheckpointMedia !== null && rvfcCheckpointCurrentTime !== null) {
-        const dVm = meta.mediaTime - rvfcCheckpointMedia
-        const dCt = ct - rvfcCheckpointCurrentTime
-        console.log(
-          `[DirectRTC][${ts()}] per-50 frames: dMedia=${dVm.toFixed(3)}s dCT=${dCt.toFixed(3)}s`
-        )
-      }
-      rvfcCheckpointMedia = meta.mediaTime
-      rvfcCheckpointCurrentTime = ct
-    } else if (rvfcCheckpointMedia === null) {
-      rvfcCheckpointMedia = meta.mediaTime
-      rvfcCheckpointCurrentTime = el.currentTime
     }
 
     rvfc(onFrame)
@@ -183,9 +549,56 @@ export function useDirectWebRTC() {
   let pc: RTCPeerConnection | null = null
   let sendSignaling: ((msg: any) => void) | null = null
   let localStream: MediaStream | null = null
+  let remoteAudioTrackForCalibration: MediaStreamTrack | null = null
   let remoteAudioElement: HTMLAudioElement | null = null
   let dedicatedAudioOutput = false
   let networkStatsTimer: ReturnType<typeof setInterval> | null = null
+  let lastAVSyncLogAtMs = 0
+  let avSyncLoggingEnabled = false
+  let avPlayoutEstimator = createAVPlayoutEstimatorState()
+
+  function setAVSyncLoggingEnabled(enabled: boolean) {
+    if (avSyncLoggingEnabled === enabled) return
+    avSyncLoggingEnabled = enabled
+    avSegmentPresentationLoggingEnabled = enabled
+    avPlayoutEstimator = createAVPlayoutEstimatorState()
+    lastAVSyncLogAtMs = 0
+    resetAVSegmentDiagnostics()
+    if (!enabled) {
+      debugState.value.avSync = null
+      debugState.value.segmentTimeline = null
+    }
+  }
+
+  function configureAVCalibration(enabled: boolean) {
+    avCalibrationEnabled = enabled
+    if (!enabled) {
+      stopAVCalibrationAudioMonitor()
+      return
+    }
+    if (remoteAudioTrackForCalibration) {
+      void startAVCalibrationAudioMonitor(remoteAudioTrackForCalibration)
+    }
+  }
+
+  function handleAVSegmentDiagnostic(data: any) {
+    const seg = parseAVSegmentTimeline(data)
+    if (!seg) return
+    appendAVSegmentTimeline(seg)
+    debugState.value.segmentTimeline = seg
+    if (!avSyncLoggingEnabled) return
+
+    const videoDurationMs = seg.fps > 0 ? (seg.videoFrames * 1000) / seg.fps : 0
+    const audioDurationMs = seg.sampleRate > 0 ? (seg.audioSamples * 1000) / seg.sampleRate : 0
+    console.log(
+      `[DirectRTC][${ts()}] AV segment timeline turn=${seg.turnSeq} segment=${seg.segmentSeq}` +
+        ` mediaStart=${seg.mediaStartMs}ms duration=${seg.durationMs}ms` +
+        ` video=${seg.videoFrames}f@${seg.fps}fps(${videoDurationMs.toFixed(1)}ms)` +
+        ` audio=${seg.audioSamples}@${seg.sampleRate}Hz(${audioDurationMs.toFixed(1)}ms)` +
+        ` publishWall=${seg.publishWallMs}` +
+        (seg.markerId > 0 ? ` marker=${seg.markerId}@${seg.markerMediaTimeMs}ms` : '')
+    )
+  }
 
   // Serialize signaling: queue operations so addIceCandidate waits for setRemoteDescription
   let signalingChain: Promise<void> = Promise.resolve()
@@ -436,6 +849,20 @@ export function useDirectWebRTC() {
         }
       })
       debugState.value.network = net
+      if (!avSyncLoggingEnabled) {
+        debugState.value.avSync = null
+        return
+      }
+      const avSync = estimateAVPlayoutFromStats(stats, avPlayoutEstimator)
+      debugState.value.avSync = avSync
+      if (!avSync.active || avSync.jitterBufferDelayDeltaMs === null) {
+        return
+      }
+      const now = Date.now()
+      if (now - lastAVSyncLogAtMs >= 1000) {
+        lastAVSyncLogAtMs = now
+        console.log(`[DirectRTC][${ts()}] ${formatJitterBufferDelta(avSync)}`)
+      }
     } catch {
       // getStats can fail during reconnection, ignore
     }
@@ -447,7 +874,10 @@ export function useDirectWebRTC() {
    * PeerConnection is created later when the server sends webrtc_offer.
    * @param signalingFn - function to send signaling messages via WebSocket
    */
-  async function connect(signalingFn: (msg: any) => void, options: { dedicatedAudioOutput?: boolean } = {}) {
+  async function connect(
+    signalingFn: (msg: any) => void,
+    options: { dedicatedAudioOutput?: boolean; avCalibration?: boolean } = {},
+  ) {
     if (connectionState.value === 'connecting' || connectionState.value === 'connected') {
       return
     }
@@ -461,6 +891,12 @@ export function useDirectWebRTC() {
     sentWebrtcReady = false
     needsPlaybackGesture.value = false
     isOutputMuted.value = false
+    avSyncLoggingEnabled = false
+    avSegmentPresentationLoggingEnabled = false
+    avPlayoutEstimator = createAVPlayoutEstimatorState()
+    lastAVSyncLogAtMs = 0
+    resetAVSegmentDiagnostics()
+    configureAVCalibration(!!options.avCalibration)
     dedicatedAudioOutput = !!options.dedicatedAudioOutput
     clearRemoteAudioElement()
 
@@ -481,6 +917,7 @@ export function useDirectWebRTC() {
 
     try {
       // Tell server we're ready for negotiation
+      sendSignaling({ type: 'av_calibration_config', enabled: !!options.avCalibration })
       sendSignaling({ type: 'webrtc_ready' })
       sentWebrtcReady = true
       pushNote('sent webrtc_ready')
@@ -551,6 +988,10 @@ export function useDirectWebRTC() {
           pushNote('audio track unmuted')
         }
         audioMST = track
+        remoteAudioTrackForCalibration = track
+        if (avCalibrationEnabled) {
+          void startAVCalibrationAudioMonitor(track)
+        }
 
         const el = videoElement.value
         if (el) {
@@ -619,6 +1060,11 @@ export function useDirectWebRTC() {
         pendingIceServers = data.ice_servers || null
         console.log(`[DirectRTC][${ts()}] received webrtc_config, ice_servers:`, pendingIceServers)
         pushNote('received webrtc_config')
+        return
+      }
+
+      if (data.type === 'av_segment_diagnostic') {
+        handleAVSegmentDiagnostic(data)
         return
       }
 
@@ -713,6 +1159,13 @@ export function useDirectWebRTC() {
     sentWebrtcReady = false
     needsPlaybackGesture.value = false
     isOutputMuted.value = false
+    avSyncLoggingEnabled = false
+    avSegmentPresentationLoggingEnabled = false
+    avPlayoutEstimator = createAVPlayoutEstimatorState()
+    lastAVSyncLogAtMs = 0
+    resetAVSegmentDiagnostics()
+    configureAVCalibration(false)
+    remoteAudioTrackForCalibration = null
 
     if (videoElement.value) {
       videoElement.value.srcObject = null
@@ -802,5 +1255,6 @@ export function useDirectWebRTC() {
     resumePlayback,
     toggleOutputMute,
     handleSignaling,
+    setAVSyncLoggingEnabled,
   }
 }

@@ -41,6 +41,24 @@ if (queryLaunchState) {
 const launchState = ref(loadSessionLaunchState(sessionId.value) || queryLaunchState)
 const streamingMode = launchState.value?.streaming_mode || 'direct'
 
+function truthyDebugFlag(value: unknown): boolean {
+  const raw = Array.isArray(value) ? value[0] : value
+  return raw === true || raw === '1' || raw === 'true' || raw === 'yes'
+}
+
+function readAVCalibrationEnabled(): boolean {
+  if (truthyDebugFlag(route.query.avCalibration) || truthyDebugFlag(route.query.av_calibration)) {
+    return true
+  }
+  try {
+    return window.localStorage.getItem('cyberverse.avCalibration') === '1'
+  } catch {
+    return false
+  }
+}
+
+const avCalibrationEnabled = readAVCalibrationEnabled()
+
 function parseVisualInputConfig(): Partial<VisualInputConfig> | undefined {
   return launchState.value?.visual_input
 }
@@ -63,6 +81,7 @@ const micBarLevels = isDirectMode ? dp.micBarLevels : lk.micBarLevels
 const toggleMute = isDirectMode ? dp.toggleMute : lk.toggleMute
 const toggleOutputMute = isDirectMode ? dp.toggleOutputMute : lk.toggleOutputMute
 const webrtcDisconnect = isDirectMode ? dp.disconnect : lk.disconnect
+const setAVSyncLoggingEnabled = isDirectMode ? dp.setAVSyncLoggingEnabled : lk.setAVSyncLoggingEnabled
 
 const outputMutedVisual = computed(() => isOutputMuted.value)
 const outputButtonTitle = computed(() => {
@@ -291,6 +310,10 @@ const displayMode = computed<'webrtc' | 'standby' | 'placeholder'>(() => {
   return result
 })
 
+watchEffect(() => {
+  setAVSyncLoggingEnabled(avatarStatus.value === 'speaking' && displayMode.value === 'webrtc')
+})
+
 // Auto-connect on mount using session params from query
 onMounted(async () => {
   if (queryLaunchState && Object.keys(route.query).length > 0) {
@@ -313,7 +336,10 @@ onMounted(async () => {
     registerSignalingHandler((data: any) => dp.handleSignaling(data))
     await dp.connect(
       (msg: any) => sendSignaling(msg),
-      { dedicatedAudioOutput: launchState.value?.avatar_enabled === false },
+      {
+        dedicatedAudioOutput: launchState.value?.avatar_enabled === false,
+        avCalibration: avCalibrationEnabled,
+      },
     )
   } else {
     // LiveKit mode

@@ -27,6 +27,7 @@ frontend/dist/
 .venv/
 .agents/
 .cursor/
+.claude/
 server/cyberverse-server
 
 # Generated proto code

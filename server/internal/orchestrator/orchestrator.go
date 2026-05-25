@@ -149,6 +149,13 @@ func desiredSamplesForVideo(frames, fps, sampleRate int) int {
 	return (frames*sampleRate + fps/2) / fps
 }
 
+func durationMSForVideo(frames, fps int) int64 {
+	if frames <= 0 || fps <= 0 {
+		return 0
+	}
+	return int64(math.Round(float64(frames) * 1000 / float64(fps)))
+}
+
 func (b *voiceAVSyncBuffer) takeSegmentPCM(frames, fps int, isFinal bool) ([]byte, int, int, int) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -618,6 +625,8 @@ func (o *Orchestrator) HandleSignaling(sessionID string, msg ws.WSMessage) {
 	}
 
 	switch msg.Type {
+	case "av_calibration_config":
+		dp.SetAVCalibrationEnabled(msg.Enabled)
 	case "webrtc_ready":
 		// Send TURN ICE server config before the SDP offer
 		if o.turnServer != nil {
@@ -2494,20 +2503,22 @@ func (o *Orchestrator) runStandardPipeline(ctx context.Context, session *Session
 	// 5. Publish paced AV segments. The standard/Qwen chain receives audio
 	// before video, so PCM is buffered and sliced to match each video segment.
 	var (
-		segVideo       []byte
-		segFrames      int
-		segWidth       int
-		segHeight      int
-		segFPS         int
-		segCount       int
-		segSeq         int64
-		firstFrameSent bool
+		segVideo        []byte
+		segFrames       int
+		segWidth        int
+		segHeight       int
+		segFPS          int
+		segCount        int
+		segSeq          int64
+		segMediaStartMS int64
+		firstFrameSent  bool
 	)
 	flushStdSeg := func(isFinalSeg bool) {
 		if segCount == 0 {
 			return
 		}
 		segSeq++
+		segDurationMS := durationMSForVideo(segFrames, segFPS)
 		if peer := lookupStdPeer(); peer != nil {
 			segPCM, outSamples, wantSamples, bufferedSamplesAfterTake := stdSyncBuf.takeSegmentPCM(segFrames, segFPS, isFinalSeg)
 			_, _, _, sampleRate := stdSyncBuf.snapshot()
@@ -2523,20 +2534,24 @@ func (o *Orchestrator) runStandardPipeline(ctx context.Context, session *Session
 				log.Printf("std av strict trim tail session=%s: trimmed_samples=%d", sessionID, bufferedSamplesAfterTake)
 			}
 			raw := &mediapeer.RawAVSegment{
-				TraceLabel: voiceTraceLabel(sessionID, turnSeq, "standard", "", segSeq),
-				Epoch:      turnSeq,
-				RGB:        segVideo,
-				PCM:        segPCM,
-				SampleRate: sampleRate,
-				Width:      segWidth,
-				Height:     segHeight,
-				FPS:        segFPS,
-				NumFrames:  segFrames,
+				TraceLabel:   voiceTraceLabel(sessionID, turnSeq, "standard", "", segSeq),
+				Epoch:        turnSeq,
+				SegmentSeq:   segSeq,
+				MediaStartMS: segMediaStartMS,
+				DurationMS:   segDurationMS,
+				RGB:          segVideo,
+				PCM:          segPCM,
+				SampleRate:   sampleRate,
+				Width:        segWidth,
+				Height:       segHeight,
+				FPS:          segFPS,
+				NumFrames:    segFrames,
 			}
 			if err := peer.SendAVSegment(raw); err != nil {
 				log.Printf("std av SendAVSegment failed session=%s: %v", sessionID, err)
 			}
 		}
+		segMediaStartMS += segDurationMS
 		segVideo = nil
 		segFrames = 0
 		segCount = 0
@@ -2976,6 +2991,7 @@ func (o *Orchestrator) runVoiceLLMPipelineWithConfig(
 				segFPS              int
 				segCount            int
 				segSeq              int64
+				segMediaStartMS     int64
 				lastKnownSampleRate int
 				firstFrameSent      bool
 				speakingBroadcasted bool
@@ -2986,6 +3002,7 @@ func (o *Orchestrator) runVoiceLLMPipelineWithConfig(
 					return
 				}
 				segSeq++
+				segDurationMS := durationMSForVideo(segFrames, segFPS)
 				peer := lookupPeer()
 				if peer != nil {
 					traceLabel := ""
@@ -2999,10 +3016,10 @@ func (o *Orchestrator) runVoiceLLMPipelineWithConfig(
 					} else {
 						sampleRate = lastKnownSampleRate
 					}
+					if sampleRate <= 0 {
+						sampleRate = 16000
+					}
 					if segSeq == 1 && outSamples < wantSamples {
-						if sampleRate <= 0 {
-							sampleRate = 16000
-						}
 						log.Printf("voice av drift for session %s: out_samples=%d want_samples=%d frames=%d fps=%d buffered_samples=%d",
 							sessionID, outSamples, wantSamples, segFrames, segFPS, bufferedSamples)
 					}
@@ -3010,16 +3027,19 @@ func (o *Orchestrator) runVoiceLLMPipelineWithConfig(
 						log.Printf("voice av strict trim tail session=%s: trimmed_samples=%d", sessionID, bufferedSamplesAfterTake)
 					}
 					raw := &mediapeer.RawAVSegment{
-						TraceLabel:  traceLabel,
-						Epoch:       turn.seq,
-						RGB:         segVideo,
-						PCM:         segPCM,
-						UserFinalAt: turn.userFinalAt,
-						SampleRate:  sampleRate,
-						Width:       segWidth,
-						Height:      segHeight,
-						FPS:         segFPS,
-						NumFrames:   segFrames,
+						TraceLabel:   traceLabel,
+						Epoch:        turn.seq,
+						SegmentSeq:   segSeq,
+						MediaStartMS: segMediaStartMS,
+						DurationMS:   segDurationMS,
+						RGB:          segVideo,
+						PCM:          segPCM,
+						UserFinalAt:  turn.userFinalAt,
+						SampleRate:   sampleRate,
+						Width:        segWidth,
+						Height:       segHeight,
+						FPS:          segFPS,
+						NumFrames:    segFrames,
 					}
 					if err := peer.SendAVSegment(raw); err != nil {
 						log.Printf("voice av SendAVSegment failed session=%s seg=%d: %v", sessionID, segSeq, err)
@@ -3029,6 +3049,7 @@ func (o *Orchestrator) runVoiceLLMPipelineWithConfig(
 						turnRec.WriteAudioChunk(segPCM, sampleRate)
 					}
 				}
+				segMediaStartMS += segDurationMS
 				segVideo = nil
 				segFrames = 0
 				segCount = 0
@@ -3812,20 +3833,22 @@ func (o *Orchestrator) runAssistantSpeechPipeline(ctx context.Context, session *
 	videoCh, videoErrCh := o.inference.GenerateAvatarStream(ctx, avatarAudioCh)
 
 	var (
-		segVideo       []byte
-		segFrames      int
-		segWidth       int
-		segHeight      int
-		segFPS         int
-		segCount       int
-		segSeq         int64
-		firstFrameSent bool
+		segVideo        []byte
+		segFrames       int
+		segWidth        int
+		segHeight       int
+		segFPS          int
+		segCount        int
+		segSeq          int64
+		segMediaStartMS int64
+		firstFrameSent  bool
 	)
 	flushSeg := func(isFinalSeg bool) {
 		if segCount == 0 {
 			return
 		}
 		segSeq++
+		segDurationMS := durationMSForVideo(segFrames, segFPS)
 		if peer := lookupPeer(); peer != nil {
 			segPCM, _, _, _ := syncBuf.takeSegmentPCM(segFrames, segFPS, isFinalSeg)
 			_, _, _, sampleRate := syncBuf.snapshot()
@@ -3833,20 +3856,24 @@ func (o *Orchestrator) runAssistantSpeechPipeline(ctx context.Context, session *
 				sampleRate = 16000
 			}
 			raw := &mediapeer.RawAVSegment{
-				TraceLabel: voiceTraceLabel(sessionID, turnSeq, "task", "", segSeq),
-				Epoch:      turnSeq,
-				RGB:        segVideo,
-				PCM:        segPCM,
-				SampleRate: sampleRate,
-				Width:      segWidth,
-				Height:     segHeight,
-				FPS:        segFPS,
-				NumFrames:  segFrames,
+				TraceLabel:   voiceTraceLabel(sessionID, turnSeq, "task", "", segSeq),
+				Epoch:        turnSeq,
+				SegmentSeq:   segSeq,
+				MediaStartMS: segMediaStartMS,
+				DurationMS:   segDurationMS,
+				RGB:          segVideo,
+				PCM:          segPCM,
+				SampleRate:   sampleRate,
+				Width:        segWidth,
+				Height:       segHeight,
+				FPS:          segFPS,
+				NumFrames:    segFrames,
 			}
 			if err := peer.SendAVSegment(raw); err != nil {
 				log.Printf("assistant speech SendAVSegment failed session=%s: %v", sessionID, err)
 			}
 		}
+		segMediaStartMS += segDurationMS
 		segVideo = nil
 		segFrames = 0
 		segCount = 0

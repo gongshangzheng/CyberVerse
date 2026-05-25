@@ -39,6 +39,7 @@ type WSMessage struct {
 	Height      int32   `json:"height,omitempty"`
 	TimestampMS int64   `json:"timestamp_ms,omitempty"`
 	FrameSeq    int64   `json:"frame_seq,omitempty"`
+	Enabled     bool    `json:"enabled,omitempty"`
 }
 
 // ReadPump reads messages from the WebSocket and dispatches them via onMessage.

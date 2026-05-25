@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log"
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -85,9 +86,11 @@ type DirectPeer struct {
 	// RTP timestamp gap correction: tracks the wall-clock time of the
 	// last WriteSample call so the next segment's first sample can carry
 	// a Duration that advances the RTP timestamp over the idle gap.
-	lastVideoWriteTime time.Time
-	lastAudioWriteTime time.Time
-	playbackEpoch      atomic.Uint64
+	lastVideoWriteTime     time.Time
+	lastAudioWriteTime     time.Time
+	playbackEpoch          atomic.Uint64
+	avCalibrationEnabled   atomic.Bool
+	avCalibrationMarkerSeq atomic.Int64
 }
 
 // NewDirectPeer creates a new P2P WebRTC peer for the given session.
@@ -242,6 +245,11 @@ func (p *DirectPeer) Connect(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// SetAVCalibrationEnabled toggles explicit in-band AV marker injection for diagnostics.
+func (p *DirectPeer) SetAVCalibrationEnabled(enabled bool) {
+	p.avCalibrationEnabled.Store(enabled)
 }
 
 // readRTCP continuously reads RTCP packets from an RTPSender.
@@ -488,6 +496,10 @@ func (p *DirectPeer) runEncoder() {
 			raw.UserFinalAt,
 			time.Since(raw.QueuedAt).Milliseconds(),
 		)
+		if p.avCalibrationEnabled.Load() {
+			p.injectAVCalibrationMarker(raw)
+		}
+
 		vp8Samples, err := mediapeer.EncodeRGBChunkToVP8Samples(raw.RGB, raw.Width, raw.Height, raw.NumFrames, raw.FPS)
 		if err != nil {
 			log.Printf("[DirectPeer] encode failed: %v", err)
@@ -505,17 +517,24 @@ func (p *DirectPeer) runEncoder() {
 		)
 
 		seg := &mediapeer.AVSegment{
-			TraceLabel:  raw.TraceLabel,
-			Epoch:       raw.Epoch,
-			VP8Samples:  vp8Samples,
-			PCM:         raw.PCM,
-			UserFinalAt: raw.UserFinalAt,
-			SampleRate:  raw.SampleRate,
-			Width:       raw.Width,
-			Height:      raw.Height,
-			FPS:         raw.FPS,
-			NumFrames:   raw.NumFrames,
-			QueuedAt:    raw.QueuedAt,
+			TraceLabel:        raw.TraceLabel,
+			Epoch:             raw.Epoch,
+			SegmentSeq:        raw.SegmentSeq,
+			MediaStartMS:      raw.MediaStartMS,
+			DurationMS:        raw.DurationMS,
+			MarkerID:          raw.MarkerID,
+			MarkerMediaMS:     raw.MarkerMediaMS,
+			MarkerDurationMS:  raw.MarkerDurationMS,
+			MarkerFrequencyHz: raw.MarkerFrequencyHz,
+			VP8Samples:        vp8Samples,
+			PCM:               raw.PCM,
+			UserFinalAt:       raw.UserFinalAt,
+			SampleRate:        raw.SampleRate,
+			Width:             raw.Width,
+			Height:            raw.Height,
+			FPS:               raw.FPS,
+			NumFrames:         raw.NumFrames,
+			QueuedAt:          raw.QueuedAt,
 		}
 		select {
 		case p.publishCh <- seg:
@@ -523,6 +542,101 @@ func (p *DirectPeer) runEncoder() {
 			return
 		}
 	}
+}
+
+func (p *DirectPeer) injectAVCalibrationMarker(raw *mediapeer.RawAVSegment) {
+	if raw == nil || raw.NumFrames <= 0 || raw.Width <= 0 || raw.Height <= 0 || raw.FPS <= 0 {
+		return
+	}
+	if len(raw.RGB) < raw.Width*raw.Height*3*raw.NumFrames || len(raw.PCM) == 0 || raw.SampleRate <= 0 {
+		return
+	}
+
+	frameIndex := 0
+	if raw.NumFrames > 4 {
+		frameIndex = 2
+	}
+	markerFrames := 1
+	if raw.NumFrames-frameIndex > 1 {
+		markerFrames = 2
+	}
+	markerOffsetMS := int64(math.Round(float64(frameIndex) * 1000 / float64(raw.FPS)))
+	markerDurationMS := int64(math.Round(float64(markerFrames) * 1000 / float64(raw.FPS)))
+	if markerDurationMS < 60 {
+		markerDurationMS = 60
+	}
+
+	raw.MarkerID = p.avCalibrationMarkerSeq.Add(1)
+	raw.MarkerMediaMS = raw.MediaStartMS + markerOffsetMS
+	raw.MarkerDurationMS = markerDurationMS
+	raw.MarkerFrequencyHz = 1800
+
+	paintAVCalibrationFlash(raw, frameIndex, markerFrames)
+	mixAVCalibrationChirp(raw.PCM, raw.SampleRate, markerOffsetMS, markerDurationMS, raw.MarkerFrequencyHz)
+}
+
+func paintAVCalibrationFlash(raw *mediapeer.RawAVSegment, frameIndex, markerFrames int) {
+	blockW := minInt(raw.Width, maxInt(48, raw.Width/5))
+	blockH := minInt(raw.Height, maxInt(48, raw.Height/5))
+	frameSize := raw.Width * raw.Height * 3
+	for f := frameIndex; f < frameIndex+markerFrames && f < raw.NumFrames; f++ {
+		base := f * frameSize
+		for y := 0; y < blockH; y++ {
+			row := base + y*raw.Width*3
+			for x := 0; x < blockW; x++ {
+				i := row + x*3
+				raw.RGB[i] = 255
+				raw.RGB[i+1] = 0
+				raw.RGB[i+2] = 255
+			}
+		}
+	}
+}
+
+func mixAVCalibrationChirp(pcm []byte, sampleRate int, offsetMS, durationMS int64, frequencyHz int) {
+	start := int((offsetMS * int64(sampleRate)) / 1000)
+	count := int((durationMS * int64(sampleRate)) / 1000)
+	if count <= 0 || start < 0 || start >= len(pcm)/2 {
+		return
+	}
+	if start+count > len(pcm)/2 {
+		count = len(pcm)/2 - start
+	}
+	const amplitude = 22000
+	fadeSamples := maxInt(1, sampleRate/200)
+	for i := 0; i < count; i++ {
+		t := float64(i) / float64(sampleRate)
+		fade := 1.0
+		if i < fadeSamples {
+			fade = float64(i) / float64(fadeSamples)
+		} else if remain := count - i; remain < fadeSamples {
+			fade = float64(remain) / float64(fadeSamples)
+		}
+		add := int(math.Round(math.Sin(2*math.Pi*float64(frequencyHz)*t) * amplitude * fade))
+		idx := (start + i) * 2
+		current := int(int16(binary.LittleEndian.Uint16(pcm[idx:])))
+		next := current + add
+		if next > 32767 {
+			next = 32767
+		} else if next < -32768 {
+			next = -32768
+		}
+		binary.LittleEndian.PutUint16(pcm[idx:], uint16(int16(next)))
+	}
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func (p *DirectPeer) runPublisher() {
@@ -592,6 +706,7 @@ func (p *DirectPeer) publishAVSegment(seg *mediapeer.AVSegment) {
 
 	nVideo := len(seg.VP8Samples)
 	nAudio := len(opusFrames)
+	p.sendAVSegmentDiagnostic(seg, publishStart)
 
 	// --- RTP timestamp gap correction ---
 	// Between segments WriteSample pauses; without a Duration bump the browser
@@ -662,6 +777,36 @@ func (p *DirectPeer) publishAVSegment(seg *mediapeer.AVSegment) {
 	// Record the last write time for gap correction on the next segment.
 	p.lastVideoWriteTime = time.Now()
 	p.lastAudioWriteTime = p.lastVideoWriteTime
+}
+
+func (p *DirectPeer) sendAVSegmentDiagnostic(seg *mediapeer.AVSegment, publishStart time.Time) {
+	if p.signalingFn == nil || seg == nil || seg.SegmentSeq <= 0 {
+		return
+	}
+	fps := seg.FPS
+	if fps <= 0 {
+		fps = 25
+	}
+	durationMS := seg.DurationMS
+	if durationMS <= 0 && seg.NumFrames > 0 && fps > 0 {
+		durationMS = int64(math.Round(float64(seg.NumFrames) * 1000 / float64(fps)))
+	}
+	p.signalingFn(p.sessionID, map[string]any{
+		"type":                 "av_segment_diagnostic",
+		"turn_seq":             seg.Epoch,
+		"segment_seq":          seg.SegmentSeq,
+		"media_start_ms":       seg.MediaStartMS,
+		"duration_ms":          durationMS,
+		"video_frames":         seg.NumFrames,
+		"fps":                  fps,
+		"audio_samples":        len(seg.PCM) / 2,
+		"sample_rate":          seg.SampleRate,
+		"publish_wall_ms":      publishStart.UnixMilli(),
+		"marker_id":            seg.MarkerID,
+		"marker_media_time_ms": seg.MarkerMediaMS,
+		"marker_duration_ms":   seg.MarkerDurationMS,
+		"marker_frequency_hz":  seg.MarkerFrequencyHz,
+	})
 }
 
 func (p *DirectPeer) isPlaybackStale(epoch uint64) bool {

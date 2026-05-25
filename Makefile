@@ -64,7 +64,7 @@ server:
 	    $(GO) run -tags livekit ./cmd/cyberverse-server/ --config ../cyberverse_config.yaml
 
 frontend:
-	@if [ -n "$(NODE_BIN)" ]; then export PATH=$(NODE_BIN):$$PATH; fi; cd frontend && npm run dev
+	@if [ -n "$(NODE_BIN)" ]; then export PATH=$(NODE_BIN):$$PATH; fi; cd frontend && CHOKIDAR_USEPOLLING=true npm run dev
 
 # Build
 build: build-go frontend-build

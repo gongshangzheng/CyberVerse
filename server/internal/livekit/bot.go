@@ -503,16 +503,23 @@ func (b *Bot) runEncoder() {
 			continue
 		}
 		seg := &AVSegment{
-			TraceLabel: raw.TraceLabel,
-			Epoch:      raw.Epoch,
-			VP8Samples: vp8Samples,
-			PCM:        raw.PCM,
-			SampleRate: raw.SampleRate,
-			Width:      raw.Width,
-			Height:     raw.Height,
-			FPS:        raw.FPS,
-			NumFrames:  raw.NumFrames,
-			QueuedAt:   raw.QueuedAt,
+			TraceLabel:        raw.TraceLabel,
+			Epoch:             raw.Epoch,
+			SegmentSeq:        raw.SegmentSeq,
+			MediaStartMS:      raw.MediaStartMS,
+			DurationMS:        raw.DurationMS,
+			MarkerID:          raw.MarkerID,
+			MarkerMediaMS:     raw.MarkerMediaMS,
+			MarkerDurationMS:  raw.MarkerDurationMS,
+			MarkerFrequencyHz: raw.MarkerFrequencyHz,
+			VP8Samples:        vp8Samples,
+			PCM:               raw.PCM,
+			SampleRate:        raw.SampleRate,
+			Width:             raw.Width,
+			Height:            raw.Height,
+			FPS:               raw.FPS,
+			NumFrames:         raw.NumFrames,
+			QueuedAt:          raw.QueuedAt,
 		}
 		select {
 		case b.publishCh <- seg:

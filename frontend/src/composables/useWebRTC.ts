@@ -99,6 +99,39 @@ export type WebRTCNetworkStats = {
   codec: string
 }
 
+export type AVPlayoutEstimate = {
+  estimatedPlayoutOffsetMs: number | null
+  jitterBufferDelayDeltaMs: number | null
+  videoJitterBufferDelayMs: number | null
+  audioJitterBufferDelayMs: number | null
+  rawEstimatedPlayoutOffsetMs: number | null
+  videoEstimatedPlayoutTimestampMs: number | null
+  audioEstimatedPlayoutTimestampMs: number | null
+  audioPacketsDelta: number | null
+  videoPacketsDelta: number | null
+  videoFramesDelta: number | null
+  active: boolean
+  source: 'estimatedPlayoutTimestamp' | 'estimatedPlayoutTimestampOutOfRange' | 'unavailable'
+  reason: 'ok' | 'warmingUp' | 'missingInboundRtp' | 'inactiveStats' | 'offsetOutOfRange' | 'offsetJump'
+}
+
+export type AVSegmentTimeline = {
+  turnSeq: number
+  segmentSeq: number
+  mediaStartMs: number
+  durationMs: number
+  videoFrames: number
+  fps: number
+  audioSamples: number
+  sampleRate: number
+  publishWallMs: number
+  receivedWallMs: number
+  markerId: number
+  markerMediaTimeMs: number
+  markerDurationMs: number
+  markerFrequencyHz: number
+}
+
 export type AVSyncDebugState = {
   sessionId: string
   connectionState: ConnectionState
@@ -120,6 +153,8 @@ export type AVSyncDebugState = {
   // Quantitative diagnostics.
   jitter: FrameJitterStats
   network: WebRTCNetworkStats | null
+  avSync: AVPlayoutEstimate | null
+  segmentTimeline: AVSegmentTimeline | null
 }
 
 const emptyNetworkStats = (): WebRTCNetworkStats => ({
@@ -161,7 +196,201 @@ const emptyDebugState = (): AVSyncDebugState => ({
   notes: [],
   jitter: { meanIntervalMs: 0, stddevMs: 0, maxIntervalMs: 0, p95IntervalMs: 0, stutterCount: 0, windowSize: 0 },
   network: null,
+  avSync: null,
+  segmentTimeline: null,
 })
+
+type InboundTimingStats = {
+  jitterBufferDelayMs: number | null
+  estimatedPlayoutTimestampMs: number | null
+  packetsReceived: number
+  framesDecoded: number
+}
+
+const maxUsefulRelativeDelayMs = 1000
+const maxEstimatedPlayoutOffsetJumpMs = 500
+
+export type AVPlayoutEstimatorState = {
+  audioPacketsReceived: number | null
+  videoPacketsReceived: number | null
+  videoFramesDecoded: number | null
+  lastObservedOffsetMs: number | null
+}
+
+export function createAVPlayoutEstimatorState(): AVPlayoutEstimatorState {
+  return {
+    audioPacketsReceived: null,
+    videoPacketsReceived: null,
+    videoFramesDecoded: null,
+    lastObservedOffsetMs: null,
+  }
+}
+
+function roundMs(value: number): number {
+  return Math.round(value * 10) / 10
+}
+
+function readJitterBufferDelayMs(report: any): number | null {
+  const emittedCount = Number(report.jitterBufferEmittedCount ?? 0)
+  if (!Number.isFinite(emittedCount) || emittedCount <= 0) {
+    return null
+  }
+
+  const delaySeconds = Number(report.jitterBufferDelay)
+  if (!Number.isFinite(delaySeconds)) {
+    return null
+  }
+
+  return roundMs((delaySeconds / emittedCount) * 1000)
+}
+
+function readInboundTimingStats(report: any): InboundTimingStats {
+  const estimatedPlayoutTimestamp = Number(report.estimatedPlayoutTimestamp)
+  return {
+    jitterBufferDelayMs: readJitterBufferDelayMs(report),
+    estimatedPlayoutTimestampMs: Number.isFinite(estimatedPlayoutTimestamp)
+      ? estimatedPlayoutTimestamp
+      : null,
+    packetsReceived: Number(report.packetsReceived ?? 0),
+    framesDecoded: Number(report.framesDecoded ?? 0),
+  }
+}
+
+function preferInboundTimingStats(current: InboundTimingStats | null, next: InboundTimingStats): InboundTimingStats {
+  if (!current) return next
+  const currentScore = current.packetsReceived + current.framesDecoded
+  const nextScore = next.packetsReceived + next.framesDecoded
+  return nextScore >= currentScore ? next : current
+}
+
+export function estimateAVPlayoutFromStats(
+  stats: RTCStatsReport,
+  state: AVPlayoutEstimatorState,
+): AVPlayoutEstimate {
+  const timing: {
+    audio: InboundTimingStats | null
+    video: InboundTimingStats | null
+  } = {
+    audio: null,
+    video: null,
+  }
+
+  stats.forEach((report) => {
+    if (report.type !== 'inbound-rtp') return
+    const kind = report.kind ?? report.mediaType
+    if (kind === 'audio') {
+      timing.audio = preferInboundTimingStats(timing.audio, readInboundTimingStats(report))
+    } else if (kind === 'video') {
+      timing.video = preferInboundTimingStats(timing.video, readInboundTimingStats(report))
+    }
+  })
+
+  const videoJitterBufferDelayMs = timing.video?.jitterBufferDelayMs ?? null
+  const audioJitterBufferDelayMs = timing.audio?.jitterBufferDelayMs ?? null
+  const videoEstimatedPlayoutTimestampMs = timing.video?.estimatedPlayoutTimestampMs ?? null
+  const audioEstimatedPlayoutTimestampMs = timing.audio?.estimatedPlayoutTimestampMs ?? null
+  const rawEstimatedPlayoutOffsetMs =
+    videoEstimatedPlayoutTimestampMs !== null && audioEstimatedPlayoutTimestampMs !== null
+      ? roundMs(videoEstimatedPlayoutTimestampMs - audioEstimatedPlayoutTimestampMs)
+      : null
+  const jitterBufferDelayDeltaMs =
+    videoJitterBufferDelayMs !== null && audioJitterBufferDelayMs !== null
+      ? roundMs(videoJitterBufferDelayMs - audioJitterBufferDelayMs)
+      : null
+
+  const audioPacketsDelta = timing.audio && state.audioPacketsReceived !== null
+    ? timing.audio.packetsReceived - state.audioPacketsReceived
+    : null
+  const videoPacketsDelta = timing.video && state.videoPacketsReceived !== null
+    ? timing.video.packetsReceived - state.videoPacketsReceived
+    : null
+  const videoFramesDelta = timing.video && state.videoFramesDecoded !== null
+    ? timing.video.framesDecoded - state.videoFramesDecoded
+    : null
+
+  if (timing.audio) {
+    state.audioPacketsReceived = timing.audio.packetsReceived
+  }
+  if (timing.video) {
+    state.videoPacketsReceived = timing.video.packetsReceived
+    state.videoFramesDecoded = timing.video.framesDecoded
+  }
+
+  let estimatedPlayoutOffsetMs: number | null = null
+  let source: AVPlayoutEstimate['source'] = 'unavailable'
+  let reason: AVPlayoutEstimate['reason'] = 'ok'
+  const hasInboundRtp = !!timing.audio && !!timing.video
+  const hasGrowthBaseline =
+    audioPacketsDelta !== null && videoPacketsDelta !== null && videoFramesDelta !== null
+  const active =
+    hasGrowthBaseline &&
+    audioPacketsDelta > 0 &&
+    (videoPacketsDelta > 0 || videoFramesDelta > 0)
+
+  if (!hasInboundRtp) {
+    reason = 'missingInboundRtp'
+  } else if (!hasGrowthBaseline) {
+    reason = 'warmingUp'
+  } else if (!active) {
+    reason = 'inactiveStats'
+  } else if (rawEstimatedPlayoutOffsetMs === null) {
+    reason = 'missingInboundRtp'
+  } else if (Math.abs(rawEstimatedPlayoutOffsetMs) > maxUsefulRelativeDelayMs) {
+    reason = 'offsetOutOfRange'
+    source = 'estimatedPlayoutTimestampOutOfRange'
+  } else if (
+    state.lastObservedOffsetMs !== null &&
+    Math.abs(rawEstimatedPlayoutOffsetMs - state.lastObservedOffsetMs) > maxEstimatedPlayoutOffsetJumpMs
+  ) {
+    reason = 'offsetJump'
+    source = 'estimatedPlayoutTimestampOutOfRange'
+    state.lastObservedOffsetMs = rawEstimatedPlayoutOffsetMs
+  } else {
+    estimatedPlayoutOffsetMs = rawEstimatedPlayoutOffsetMs
+    state.lastObservedOffsetMs = estimatedPlayoutOffsetMs
+    source = 'estimatedPlayoutTimestamp'
+  }
+
+  return {
+    estimatedPlayoutOffsetMs,
+    jitterBufferDelayDeltaMs,
+    videoJitterBufferDelayMs,
+    audioJitterBufferDelayMs,
+    rawEstimatedPlayoutOffsetMs,
+    videoEstimatedPlayoutTimestampMs,
+    audioEstimatedPlayoutTimestampMs,
+    audioPacketsDelta,
+    videoPacketsDelta,
+    videoFramesDelta,
+    active,
+    source,
+    reason,
+  }
+}
+
+export function formatAVPlayoutEstimate(estimate: AVPlayoutEstimate): string {
+  const value = (n: number | null) => (n === null ? 'N/A' : n.toFixed(1))
+  const offset = estimate.estimatedPlayoutOffsetMs !== null
+    ? `AVOffset estimatedPlayoutOffsetMs=${value(estimate.estimatedPlayoutOffsetMs)}ms `
+    : 'AVOffset unavailable '
+  const rawOffset = estimate.estimatedPlayoutOffsetMs !== null && estimate.source === 'estimatedPlayoutTimestampOutOfRange'
+    ? ` rawEstimatedPlayoutOffset=${value(estimate.rawEstimatedPlayoutOffsetMs)}ms ignored`
+    : ''
+  return (
+    offset +
+    `| JBDelta~${value(estimate.jitterBufferDelayDeltaMs)}ms ` +
+    `(video_jb~${value(estimate.videoJitterBufferDelayMs)}ms audio_jb~${value(estimate.audioJitterBufferDelayMs)}ms) ` +
+    `| source=${estimate.source} reason=${estimate.reason}${rawOffset}`
+  )
+}
+
+export function formatJitterBufferDelta(estimate: AVPlayoutEstimate): string {
+  const value = (n: number | null) => (n === null ? 'N/A' : n.toFixed(1))
+  return (
+    `JBDelta~${value(estimate.jitterBufferDelayDeltaMs)}ms ` +
+    `(video_jb~${value(estimate.videoJitterBufferDelayMs)}ms audio_jb~${value(estimate.audioJitterBufferDelayMs)}ms)`
+  )
+}
 
 function resetState() {
   _videoMST = null
@@ -288,6 +517,19 @@ export function useWebRTC() {
   let room: InstanceType<typeof Room> | null = null
   const pendingVideoTracks: RemoteTrack[] = []
   let networkStatsTimer: ReturnType<typeof setInterval> | null = null
+  let lastAVSyncLogAtMs = 0
+  let avSyncLoggingEnabled = false
+  let avPlayoutEstimator = createAVPlayoutEstimatorState()
+
+  function setAVSyncLoggingEnabled(enabled: boolean) {
+    if (avSyncLoggingEnabled === enabled) return
+    avSyncLoggingEnabled = enabled
+    avPlayoutEstimator = createAVPlayoutEstimatorState()
+    lastAVSyncLogAtMs = 0
+    if (!enabled) {
+      debugState.value.avSync = null
+    }
+  }
 
   /** Collect WebRTC statistics from the RTCPeerConnection inside the LiveKit Room. */
   async function pollNetworkStats() {
@@ -334,6 +576,20 @@ export function useWebRTC() {
         }
       })
       debugState.value.network = net
+      if (!avSyncLoggingEnabled) {
+        debugState.value.avSync = null
+        return
+      }
+      const avSync = estimateAVPlayoutFromStats(stats, avPlayoutEstimator)
+      debugState.value.avSync = avSync
+      if (!avSync.active) {
+        return
+      }
+      const now = Date.now()
+      if (now - lastAVSyncLogAtMs >= 1000) {
+        lastAVSyncLogAtMs = now
+        console.log(`[AVSync][${ts()}] ${formatAVPlayoutEstimate(avSync)}`)
+      }
     } catch {
       // getStats can fail during reconnection, ignore
     }
@@ -528,6 +784,9 @@ export function useWebRTC() {
     error.value = ''
     needsPlaybackGesture.value = false
     isOutputMuted.value = false
+    avSyncLoggingEnabled = false
+    avPlayoutEstimator = createAVPlayoutEstimatorState()
+    lastAVSyncLogAtMs = 0
     resetState()
 
     try {
@@ -638,6 +897,9 @@ export function useWebRTC() {
     pendingVideoTracks.length = 0
     needsPlaybackGesture.value = false
     isOutputMuted.value = false
+    avSyncLoggingEnabled = false
+    avPlayoutEstimator = createAVPlayoutEstimatorState()
+    lastAVSyncLogAtMs = 0
 
     // Clear the combined stream from the <video> element.
     if (videoElement.value) {
@@ -722,5 +984,6 @@ export function useWebRTC() {
     toggleMute,
     resumePlayback,
     toggleOutputMute,
+    setAVSyncLoggingEnabled,
   }
 }

@@ -580,6 +580,7 @@ export function useChat(sessionId: () => string) {
         case 'webrtc_config':
         case 'webrtc_offer':
         case 'ice_candidate':
+        case 'av_segment_diagnostic':
           if (signalingHandler) {
             signalingHandler(data)
           }
