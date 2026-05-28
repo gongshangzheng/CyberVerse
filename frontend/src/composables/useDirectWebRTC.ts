@@ -760,6 +760,7 @@ export function useDirectWebRTC() {
 
   // TURN ICE servers received from server via webrtc_config
   let pendingIceServers: RTCIceServer[] | null = null
+  let pendingRemoteIceCandidates: RTCIceCandidateInit[] = []
 
   const isMuted = ref(false)
   let sentWebrtcReady = false
@@ -1049,6 +1050,7 @@ export function useDirectWebRTC() {
     sendSignaling = signalingFn
     avSyncFeedbackSender = signalingFn
     pendingIceServers = null
+    pendingRemoteIceCandidates = []
     sentWebrtcReady = false
     resetDirectMediaPoisonState(true)
     needsPlaybackGesture.value = false
@@ -1214,6 +1216,41 @@ export function useDirectWebRTC() {
     return newPc
   }
 
+  function remoteIceCandidateFromSignal(data: any): RTCIceCandidateInit | null {
+    if (!data?.candidate) return null
+    return {
+      candidate: data.candidate,
+      sdpMid: data.sdp_mid ?? undefined,
+      sdpMLineIndex: data.sdp_mline_index ?? undefined,
+    }
+  }
+
+  async function addRemoteIceCandidate(candidate: RTCIceCandidateInit) {
+    if (!pc || !pc.remoteDescription) {
+      pendingRemoteIceCandidates.push(candidate)
+      pushNote('queued remote ICE candidate')
+      return
+    }
+
+    const candidateText = candidate.candidate || ''
+    console.log(`[DirectRTC][${ts()}] adding remote ICE candidate: ${candidateText.substring(0, 80)}...`)
+    try {
+      await pc.addIceCandidate(new RTCIceCandidate(candidate))
+      console.log(`[DirectRTC][${ts()}] ICE candidate added successfully`)
+    } catch (e) {
+      console.warn('[DirectRTC] addIceCandidate failed:', e)
+    }
+  }
+
+  async function flushPendingRemoteIceCandidates() {
+    if (!pc || !pc.remoteDescription || pendingRemoteIceCandidates.length === 0) return
+    const pending = pendingRemoteIceCandidates
+    pendingRemoteIceCandidates = []
+    for (const candidate of pending) {
+      await addRemoteIceCandidate(candidate)
+    }
+  }
+
   /**
    * Handle incoming signaling messages from the server (via WebSocket).
    * Operations are serialized so that addIceCandidate always waits for
@@ -1248,6 +1285,7 @@ export function useDirectWebRTC() {
           type: 'offer',
           sdp: data.sdp,
         }))
+        await flushPendingRemoteIceCandidates()
         const answer = await pc.createAnswer()
         await pc.setLocalDescription(answer)
         sendSignaling?.({
@@ -1260,18 +1298,8 @@ export function useDirectWebRTC() {
       }
 
       if (data.type === 'ice_candidate' && data.candidate) {
-        if (!pc) return
-        console.log(`[DirectRTC][${ts()}] adding remote ICE candidate: ${data.candidate.substring(0, 80)}...`)
-        try {
-          await pc.addIceCandidate(new RTCIceCandidate({
-            candidate: data.candidate,
-            sdpMid: data.sdp_mid ?? undefined,
-            sdpMLineIndex: data.sdp_mline_index ?? undefined,
-          }))
-          console.log(`[DirectRTC][${ts()}] ICE candidate added successfully`)
-        } catch (e) {
-          console.warn('[DirectRTC] addIceCandidate failed:', e)
-        }
+        const candidate = remoteIceCandidateFromSignal(data)
+        if (candidate) await addRemoteIceCandidate(candidate)
       }
     }).catch(e => {
       console.error('[DirectRTC] signaling chain error:', e)
@@ -1296,6 +1324,7 @@ export function useDirectWebRTC() {
     clearRemoteAudioElement()
     resetState()
     resetAVSegmentDiagnostics()
+    pendingRemoteIceCandidates = []
     avPlayoutEstimator = createAVPlayoutEstimatorState()
     lastAVSyncLogAtMs = 0
     debugState.value = { ...emptyDebugState(), connectionState: 'connecting', notes }

@@ -404,8 +404,6 @@ func readRTCP(sender *webrtc.RTPSender) {
 
 // StartNegotiation creates an SDP offer and sends it to the browser.
 // Call this after the browser sends "webrtc_ready" via WebSocket.
-// It waits for ICE gathering to complete so all candidates are embedded
-// in the SDP offer itself (no trickle needed).
 func (p *DirectPeer) StartNegotiation() error {
 	p.mu.Lock()
 	pc := p.pc
@@ -422,22 +420,18 @@ func (p *DirectPeer) StartNegotiation() error {
 		return fmt.Errorf("set local description: %w", err)
 	}
 
-	// Wait for ICE gathering to complete so all candidates are in the SDP.
-	// For ICE-TCP with a single TCPMux listener this is nearly instant.
-	gatherComplete := webrtc.GatheringCompletePromise(pc)
-	select {
-	case <-gatherComplete:
-	case <-time.After(5 * time.Second):
-		log.Printf("[DirectPeer] session=%s ICE gathering timeout, sending partial offer", p.sessionID)
+	// Send the SDP immediately. Local ICE candidates are trickled through the
+	// OnICECandidate callback; waiting for full gathering can add seconds before
+	// the browser can even answer.
+	localOffer := pc.LocalDescription()
+	if localOffer == nil {
+		return fmt.Errorf("local description unavailable")
 	}
-
-	// Send the complete SDP (with candidates embedded)
-	completeOffer := pc.LocalDescription()
 	p.signalingFn(p.sessionID, map[string]any{
 		"type": "webrtc_offer",
-		"sdp":  completeOffer.SDP,
+		"sdp":  localOffer.SDP,
 	})
-	log.Printf("[DirectPeer] session=%s SDP offer sent (with candidates)", p.sessionID)
+	log.Printf("[DirectPeer] session=%s SDP offer sent (trickle ICE enabled)", p.sessionID)
 	return nil
 }
 
