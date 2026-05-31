@@ -27,24 +27,6 @@ logger = logging.getLogger(__name__)
 
 PERSONA_TOOL_DEFINITIONS = [
     ToolDefinition(
-        name="wait_for_more_input",
-        description="当用户当前话语尚不完整，需要更多输入后才能回应或执行操作时使用。",
-        parameters={
-            "type": "object",
-            "properties": {
-                "partial_text": {
-                    "type": "string",
-                    "description": "已经听到的部分话语。",
-                },
-                "reason": {
-                    "type": "string",
-                    "description": "简要说明意图为何尚不完整。",
-                },
-            },
-            "required": ["partial_text"],
-        },
-    ),
-    ToolDefinition(
         name="create_task",
         description="为搜索、调研、聚合或报告类请求创建 CyberVerse 后台任务。",
         parameters={
@@ -85,9 +67,9 @@ PERSONA_TOOL_DEFINITIONS = [
 ]
 
 PERSONA_AGENT_INSTRUCTIONS = """你是 CyberVerse 数字人 PersonaAgent，直接通过语音和用户对话。
-你需要先判断用户当前表达是否已经构成完整意图。
+你需要直接判断并处理用户当前表达。
 普通寒暄、问答和闲聊：直接自然回答。
-语义明显未完成、像半句话、铺垫、犹豫或还在补充：调用 wait_for_more_input。
+表达不清或缺少必要信息：用一句自然追问澄清，不要调用工具。
 搜索、查询热点、查询知乎热榜、调研、整理资料、生成报告、生成网页或需要较长后台处理：必须调用 create_task，不要只用口头承诺代替工具调用。
 当用户已经给出明确可执行的指令时，不能再追问领域、方向、范围、偏好或“想看哪些方面”；直接调用 create_task 执行。
 “看一下今天知乎热榜”“帮我查一下知乎新鲜事”“用知乎搜索一下宇树科技”这类请求已经足够明确，必须直接创建任务。
@@ -329,15 +311,9 @@ class PersonaAgentPlugin(VoiceLLMPlugin):
         return merged.strip()
 
     @classmethod
-    def _partial_text_for_wait(cls, call: ToolCall, turn_transcripts: list[str]) -> str:
-        args = call.arguments or {}
-        return cls._clean_text(args.get("partial_text") or args.get("text")) or cls._merge_text_segments(turn_transcripts)
-
-    @classmethod
     def _final_user_text(
         cls,
         call: ToolCall,
-        pending_partials: list[str],
         turn_transcripts: list[str],
     ) -> str:
         args = call.arguments or {}
@@ -347,8 +323,7 @@ class PersonaAgentPlugin(VoiceLLMPlugin):
             or args.get("request")
             or args.get("text")
         )
-        current_text = tool_text or cls._merge_text_segments(turn_transcripts)
-        return cls._merge_text_segments([*pending_partials, current_text])
+        return tool_text or cls._merge_text_segments(turn_transcripts)
 
     @staticmethod
     def _has_assistant_output(event: VoiceLLMOutputEvent) -> bool:
@@ -513,7 +488,6 @@ class PersonaAgentPlugin(VoiceLLMPlugin):
             defer_response=True,
         )
         injected: asyncio.Queue[VoiceLLMInputEvent] = asyncio.Queue()
-        pending_partials: list[str] = []
         turn_transcripts: list[str] = []
         pending_task_starts: list[PendingSubAgentTask] = []
         background_tasks: set[asyncio.Task[None]] = set()
@@ -589,36 +563,12 @@ class PersonaAgentPlugin(VoiceLLMPlugin):
                 if event.tool_calls:
                     for call in event.tool_calls:
                         name = call.name.strip()
-                        if name == "wait_for_more_input":
-                            partial_text = self._partial_text_for_wait(call, turn_transcripts)
-                            if partial_text:
-                                pending_partials.append(partial_text)
-                            turn_transcripts.clear()
-                            try:
-                                tool_result = await self._execute_tool(call, session_config)
-                                result = tool_result.result
-                            except Exception as exc:
-                                logger.exception("persona wait tool call failed: %s", call.name)
-                                result = {"ok": False, "error": str(exc)}
-                            await injected.put(
-                                VoiceLLMInputEvent(
-                                    tool_result=ToolResult(
-                                        id=call.id,
-                                        name=call.name,
-                                        result=result,
-                                        suppress_response=True,
-                                    )
-                                )
-                            )
-                            continue
-
-                        final_user_text = self._final_user_text(call, pending_partials, turn_transcripts)
+                        final_user_text = self._final_user_text(call, turn_transcripts)
                         effective_call = call
                         if name == "create_task" and final_user_text:
                             args = dict(call.arguments or {})
                             args["description"] = final_user_text
                             effective_call = ToolCall(id=call.id, name=call.name, arguments=args)
-                        pending_partials.clear()
                         turn_transcripts.clear()
 
                         try:
@@ -643,8 +593,7 @@ class PersonaAgentPlugin(VoiceLLMPlugin):
                     model_event_task = asyncio.create_task(model_events.__anext__())
                     continue
 
-                if self._has_assistant_output(event) and (pending_partials or turn_transcripts):
-                    pending_partials.clear()
+                if self._has_assistant_output(event) and turn_transcripts:
                     turn_transcripts.clear()
                 yield event
 

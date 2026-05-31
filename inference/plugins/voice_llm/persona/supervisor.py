@@ -109,14 +109,6 @@ class PersonaSupervisor:
             route = state["route"]
             args = state.get("normalized_args") or {}
             session_id = state["session_id"]
-            if route == "wait_for_more_input":
-                return {
-                    "result": {
-                        "ok": True,
-                        "waiting": True,
-                        "partial_text": str(args.get("partial_text") or "").strip(),
-                    }
-                }
             if route == "create_task":
                 user_request = str(args.get("user_request") or "").strip()
                 if not user_request:
@@ -164,7 +156,7 @@ class PersonaSupervisor:
         return graph.compile(checkpointer=checkpointer)
 
     async def handle_tool_call(self, call: ToolCall, session_id: str) -> SupervisorToolResult:
-        if not session_id and call.name.strip() != "wait_for_more_input":
+        if not session_id:
             raise ValueError("persona tool execution requires session_id")
 
         if self._graph is None:
@@ -188,14 +180,6 @@ class PersonaSupervisor:
     async def _execute_without_graph(self, call: ToolCall, session_id: str) -> SupervisorState:
         name = call.name.strip()
         args = dict(call.arguments or {})
-        if name == "wait_for_more_input":
-            return {
-                "result": {
-                    "ok": True,
-                    "waiting": True,
-                    "partial_text": str(args.get("partial_text") or "").strip(),
-                }
-            }
         if name == "create_task":
             args = _normalize_create_task_args(args)
             user_request = str(args.get("user_request") or "").strip()

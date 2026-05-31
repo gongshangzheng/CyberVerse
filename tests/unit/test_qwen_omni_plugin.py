@@ -559,16 +559,16 @@ async def test_active_response_error_retries_response_create_without_duplicate_i
 
 
 @pytest.mark.asyncio
-async def test_send_inputs_suppresses_response_create_for_wait_tool_result():
+async def test_send_inputs_suppresses_response_create_for_suppressed_tool_result():
     plugin = QwenOmniRealtimePlugin()
     ws = FakeQwenWS([])
 
     async def inputs():
         yield VoiceLLMInputEvent(
             tool_result=ToolResult(
-                id="wait-1",
-                name="wait_for_more_input",
-                result={"ok": True, "waiting": True},
+                id="call-1",
+                name="create_task",
+                result={"ok": True},
                 suppress_response=True,
             )
         )
@@ -578,8 +578,8 @@ async def test_send_inputs_suppresses_response_create_for_wait_tool_result():
     sent_types = [event["type"] for event in ws.sent]
     assert sent_types == ["conversation.item.create"]
     assert ws.sent[0]["item"]["type"] == "function_call_output"
-    assert ws.sent[0]["item"]["call_id"] == "wait-1"
-    assert json.loads(ws.sent[0]["item"]["output"]) == {"ok": True, "waiting": True}
+    assert ws.sent[0]["item"]["call_id"] == "call-1"
+    assert json.loads(ws.sent[0]["item"]["output"]) == {"ok": True}
 
 
 @pytest.mark.asyncio

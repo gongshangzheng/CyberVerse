@@ -61,66 +61,6 @@ class FakeOmniPlugin(VoiceLLMPlugin):
             )
             return
 
-        if self.scenario == "wait_for_more_input":
-            yield VoiceLLMOutputEvent(user_transcript="我觉得...")
-            yield VoiceLLMOutputEvent(
-                tool_calls=[
-                    ToolCall(
-                        id="wait-1",
-                        name="wait_for_more_input",
-                        arguments={"partial_text": "我觉得...", "reason": "unfinished thought"},
-                    )
-                ]
-            )
-            async for event in input_stream:
-                if event.tool_result:
-                    assert event.tool_result.name == "wait_for_more_input"
-                    assert event.tool_result.suppress_response is True
-                    return
-
-        if self.scenario == "partial_create_task":
-            yield VoiceLLMOutputEvent(user_transcript="我想让你帮我查一下")
-            yield VoiceLLMOutputEvent(
-                tool_calls=[
-                    ToolCall(
-                        id="wait-1",
-                        name="wait_for_more_input",
-                        arguments={"partial_text": "我想让你帮我查一下", "reason": "missing object"},
-                    )
-                ]
-            )
-            wait_result = await self._next_tool_result(input_stream)
-            assert wait_result.name == "wait_for_more_input"
-            assert wait_result.suppress_response is True
-            await self._next_input(input_stream)
-            yield VoiceLLMOutputEvent(user_transcript="今天知乎有哪些热门信息")
-            yield VoiceLLMOutputEvent(
-                tool_calls=[
-                    ToolCall(
-                        id="call-1",
-                        name="create_task",
-                        arguments={"description": "今天知乎有哪些热门信息"},
-                    )
-                ]
-            )
-            tool_result = await self._next_tool_result(input_stream)
-            assert tool_result.name == "create_task"
-            assert tool_result.result["accepted"] is True
-            yield VoiceLLMOutputEvent(
-                transcript="好的，请稍等。",
-                audio=AudioChunk(data=b"ack", sample_rate=16000, is_final=True),
-                is_final=True,
-            )
-            final_prompt = await self._next_text(input_stream)
-            assert "用户原始请求：我想让你帮我查一下今天知乎有哪些热门信息" in final_prompt
-            assert "任务状态：completed" in final_prompt
-            yield VoiceLLMOutputEvent(
-                transcript="查好了，资料已经整理好。",
-                audio=AudioChunk(data=b"done", sample_rate=16000, is_final=True),
-                is_final=True,
-            )
-            return
-
         tool_name = self.scenario
         transcript_by_tool = {
             "create_task": "今天知乎有哪些热门信息",
@@ -342,11 +282,6 @@ async def one_input():
     yield VoiceLLMInputEvent(audio=b"pcm")
 
 
-async def two_inputs():
-    yield VoiceLLMInputEvent(audio=b"pcm-1")
-    yield VoiceLLMInputEvent(audio=b"pcm-2")
-
-
 @pytest.mark.asyncio
 async def test_persona_agent_passthrough_chat(tmp_path):
     plugin = await make_persona("chat", tmp_path / "persona.db")
@@ -365,10 +300,11 @@ async def test_persona_agent_passthrough_chat(tmp_path):
     assert outputs[0].user_transcript == "你好"
     assert outputs[1].transcript == "你好，我在。"
     assert outputs[1].audio is not None
-    assert plugin.model_plugin.last_session_config.tools[0].name == "wait_for_more_input"
-    assert plugin.model_plugin.last_session_config.tools[1].name == "create_task"
+    tool_names = [tool.name for tool in plugin.model_plugin.last_session_config.tools]
+    assert tool_names == ["create_task", "get_task_status", "cancel_task", "retrieve_character_knowledge"]
     assert plugin.model_plugin.last_session_config.defer_response is True
     assert "PersonaAgent" in plugin.model_plugin.last_session_config.system_prompt
+    assert "wait_for_more_input" not in plugin.model_plugin.last_session_config.system_prompt
     assert "JSON" not in PERSONA_AGENT_INSTRUCTIONS
     assert plugin.task_runtime.calls == []
 
@@ -538,26 +474,6 @@ async def test_persona_agent_projects_local_task_events(tmp_path, monkeypatch):
     assert completed_index < final_voice_index
 
 
-@pytest.mark.asyncio
-async def test_persona_agent_wait_tool_suppresses_output(tmp_path):
-    plugin = await make_persona("wait_for_more_input", tmp_path / "wait.db")
-
-    try:
-        outputs = [
-            event
-            async for event in plugin.converse_stream(
-                one_input(),
-                VoiceLLMSessionConfig(session_id="session-1"),
-            )
-        ]
-    finally:
-        await plugin.shutdown()
-
-    assert len(outputs) == 1
-    assert outputs[0].user_transcript == "我觉得..."
-    assert plugin.task_runtime.calls == []
-
-
 def test_persona_event_logs_keep_stream_deltas_out_of_info(caplog):
     logger_name = "inference.plugins.voice_llm.persona_agent"
 
@@ -583,32 +499,3 @@ def test_persona_event_logs_keep_stream_deltas_out_of_info(caplog):
     assert len(messages) == 1
     assert "kind=assistant_final" in messages[0]
     assert "收到" in messages[0]
-
-
-@pytest.mark.asyncio
-async def test_persona_agent_merges_waited_partial_into_create_task(tmp_path):
-    plugin = await make_persona("partial_create_task", tmp_path / "partial.db")
-
-    try:
-        outputs = [
-            event
-            async for event in plugin.converse_stream(
-                two_inputs(),
-                VoiceLLMSessionConfig(session_id="session-1"),
-            )
-        ]
-    finally:
-        await plugin.shutdown()
-
-    assert outputs[0].user_transcript == "我想让你帮我查一下"
-    assert outputs[1].user_transcript == "今天知乎有哪些热门信息"
-    assert outputs[2].transcript == "好的，请稍等。"
-    assert outputs[-1].transcript == "查好了，资料已经整理好。"
-    assert plugin.task_runtime.calls[0] == (
-        "create_task",
-        "session-1",
-        {
-            "description": "我想让你帮我查一下今天知乎有哪些热门信息",
-            "user_request": "我想让你帮我查一下今天知乎有哪些热门信息",
-        },
-    )
