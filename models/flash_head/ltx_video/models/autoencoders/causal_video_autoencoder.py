@@ -98,7 +98,7 @@ class CausalVideoAutoencoder(AutoencoderKLWrapper):
 
                 state_dict[new_key] = state_dict.pop(key)
 
-        elconfig = None
+        config = None
         if pretrained_model_name_or_path.is_file() and str(
             pretrained_model_name_or_path
         ).endswith(".safetensors"):
