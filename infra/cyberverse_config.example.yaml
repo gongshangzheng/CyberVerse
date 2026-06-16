@@ -30,7 +30,7 @@ inference:
         # served, but realtime speaking video and new idle video generation stop.
         enabled: true
         # Select the avatar backend initialized by the inference process.
-        default: "flash_head"
+        default: "live_act"
         # cached_video plays a pre-rendered standby MP4 while idle.
         # silent_inference keeps one realtime avatar stream open and feeds idle audio.
         idle_strategy: "silent_inference"

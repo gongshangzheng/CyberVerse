@@ -111,6 +111,12 @@ class CausalVideoAutoencoder(AutoencoderKLWrapper):
             configs = json.loads(metadata["config"])
             config = configs["vae"]
 
+        if not config:
+            raise FileNotFoundError(
+                f"Could not find VAE checkpoint at {pretrained_model_name_or_path}. "
+                "Please download the FlashHead model weights first."
+            )
+
         video_vae = cls.from_config(config)
         if "torch_dtype" in kwargs:
             video_vae.to(kwargs["torch_dtype"])

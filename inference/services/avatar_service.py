@@ -138,7 +138,20 @@ class AvatarGRPCService(avatar_pb2_grpc.AvatarServiceServicer):
     async def GetInfo(self, request, context):
         if not self.enabled:
             await context.abort(grpc.StatusCode.FAILED_PRECONDITION, AVATAR_DISABLED_MESSAGE)
-        plugin = self._get_plugin()
+        try:
+            plugin = self._get_plugin()
+        except RuntimeError:
+            # Avatar plugin not initialized (e.g. model weights missing or
+            # incompatible dependencies). Return an empty info response so the
+            # Go orchestrator can detect this gracefully instead of crashing.
+            return avatar_pb2.AvatarInfo(
+                model_name="",
+                output_fps=0,
+                output_width=0,
+                output_height=0,
+                frames_per_chunk=0,
+                chunk_duration_s=0.0,
+            )
         output_width, output_height = plugin.get_output_dimensions()
         fps = int(plugin.get_fps() or 25)
         frames_per_chunk = _avatar_frames_per_chunk(plugin, fps)
